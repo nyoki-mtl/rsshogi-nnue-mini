@@ -1,0 +1,13 @@
+/target/
+/dist/
+/.shogiarena-venv/
+/.uv-cache/
+/eval/
+/runs/
+/csa-logs/
+/.verification/
+/docs/book/book/
+*.exe
+*.nnue
+nn.bin
+

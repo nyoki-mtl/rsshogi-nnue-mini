@@ -1,0 +1,22 @@
+[package]
+name = "rsshogi-nnue-mini"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "A small educational USI shogi engine built with the rsshogi ecosystem"
+repository = "https://github.com/nyoki-mtl/rsshogi-nnue-mini"
+publish = false
+
+[features]
+default = []
+tuning = []
+
+[workspace]
+
+[dependencies]
+rsshogi = "=1.1.1"
+rsshogi-usi = "=0.2.0"
+
+[profile.release]
+lto = "thin"

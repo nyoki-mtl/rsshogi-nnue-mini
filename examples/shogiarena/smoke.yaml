@@ -1,0 +1,34 @@
+experiment_name: "rsshogi-nnue-mini-smoke"
+engines:
+  - name: baseline-a
+    engine_path: "engine.yaml"
+  - name: baseline-b
+    engine_path: "engine.yaml"
+instances:
+  - "instances.yaml"
+tournament:
+  scheduler: round_robin
+  games_per_pair: 2
+  num_parallel: 1
+  seed: 42
+  engine_lifecycle: reuse
+rules:
+  initial_positions:
+    type: startpos
+    flip_policy: pair_both
+    source_format: auto
+    sync_scope: pair
+    preserve_line_metadata: false
+    source: null
+  time_control:
+    node_limit: 1000
+  adjudication:
+    enable_max_plies: true
+    max_plies: 80
+    sync_max_plies_with_engine: false
+  repetition_occurrences_to_draw: 2
+dashboard:
+  enabled: false
+logging:
+  usi_transcript: true
+  usi_transcript_detail: commands

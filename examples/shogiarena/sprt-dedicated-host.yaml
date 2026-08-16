@@ -1,0 +1,30 @@
+experiment_name: "rsshogi-nnue-mini-dedicated-host-holdout-sprt"
+engines:
+  - name: baseline
+    engine_path: "baseline-dedicated-host.yaml"
+  - name: candidate
+    engine_path: "candidate-dedicated-host.yaml"
+instances:
+  - "instances-spsa.yaml"
+rules:
+  time_control:
+    node_limit: 100000
+  initial_positions:
+    type: file
+    source: "openings-holdout.sfen"
+    source_format: sfen
+    flip_policy: pair_both
+    sync_scope: pair
+sprt:
+  tested_engine: candidate
+  model: gsprt-pentanomial-v1
+  elo0: 0.0
+  elo1: 5.0
+  alpha: 0.05
+  beta: 0.05
+  min_games: 60
+  max_games: 320
+  num_parallel: 8
+dashboard:
+  enabled: true
+  api_port: 8080

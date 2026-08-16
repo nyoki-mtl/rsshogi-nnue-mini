@@ -1,0 +1,4 @@
+name: "rsshogi-nnue-mini tuning Linux"
+engine_path: "dist/rsshogi-nnue-mini-tuning-avx2"
+working_directory: "dist"
+options: {}

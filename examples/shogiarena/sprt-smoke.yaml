@@ -1,0 +1,36 @@
+experiment_name: "rsshogi-nnue-mini-sprt-protocol-smoke"
+engines:
+  - name: baseline
+    engine_path: "baseline.yaml"
+  - name: candidate
+    engine_path: "candidate.yaml"
+instances:
+  - "instances.yaml"
+rules:
+  time_control:
+    node_limit: 1000
+  initial_positions:
+    type: file
+    source: "openings-holdout.sfen"
+    source_format: sfen
+    flip_policy: pair_both
+    sync_scope: pair
+  adjudication:
+    enable_max_plies: true
+    max_plies: 80
+    sync_max_plies_with_engine: false
+sprt:
+  tested_engine: candidate
+  model: gsprt-pentanomial-v1
+  elo0: 0.0
+  elo1: 5.0
+  alpha: 0.05
+  beta: 0.05
+  min_games: 2
+  max_games: 2
+  num_parallel: 1
+dashboard:
+  enabled: false
+logging:
+  usi_transcript: true
+  usi_transcript_detail: commands

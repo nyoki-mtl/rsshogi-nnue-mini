@@ -1,0 +1,13 @@
+[book]
+title = "rsshogi-nnue-mini Book"
+authors = ["rsshogi contributors"]
+description = "小さな将棋エンジンで現代的な開発サイクルをたどる"
+language = "ja"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/nyoki-mtl/rsshogi-nnue-mini"
+edit-url-template = "https://github.com/nyoki-mtl/rsshogi-nnue-mini/edit/main/docs/book/{path}"

@@ -1,0 +1,17 @@
+name: "rsshogi-nnue-mini candidate dedicated host"
+engine_path: "dist/rsshogi-nnue-mini-tuning-avx2"
+working_directory: "dist"
+options:
+  FV_SCALE: 25
+  SearchAspirationWindow: 80
+  SearchReverseFutilityMargin: 135
+  SearchFutilityMargin: 183
+  SearchNullMoveReduction: 2
+  SearchLmpDepth1Moves: 8
+  SearchLmpDepth2Moves: 12
+  SearchLmpDepth3Moves: 19
+  SearchLmrMinDepth: 3
+  SearchLmrMoveIndex: 4
+  SearchLmrReduction: 2
+  SearchQsearchDeltaMargin: 126
+  SearchCheckBonus: 4009
