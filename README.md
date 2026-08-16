@@ -1,6 +1,8 @@
 # rsshogi-nnue-mini
 
-`rsshogi`、`rsshogi-usi`、`rsshogi-csa`、ShogiArenaを組み合わせて、現代的な将棋AI開発の一巡を読める形にする小さなUSIエンジンです。
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-0969da?logo=github)](https://nyoki-mtl.github.io/rsshogi-nnue-mini/)
+
+[rsshogi](https://github.com/nyoki-mtl/rsshogi)、[rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi)、[rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)、[ShogiArena](https://github.com/nyoki-mtl/ShogiArena)を組み合わせて、現代的な将棋AI開発の一巡を読める形にする小さなUSIエンジンです。
 
 現在のコードは、反復深化、PVS、qsearch、TT、主要な枝刈り、Lazy SMP、常駐USI探索workerを実装しています。
 standard `HalfKP256x32x32`はstrict loader、実行時に選ぶscalar/AVX2推論、指し手から差分を求めるaccumulatorを備え、公式の水匠5 `nn.bin`と独立したYaneuraOu実行ファイルを使う外部parity testも通しています。
