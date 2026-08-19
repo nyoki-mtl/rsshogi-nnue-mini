@@ -1,6 +1,6 @@
 [package]
 name = "rsshogi-nnue-mini"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,7 +15,7 @@ tuning = []
 [workspace]
 
 [dependencies]
-rsshogi = "=1.1.1"
+rsshogi = "=1.2.3"
 rsshogi-usi = "=0.2.0"
 
 [profile.release]

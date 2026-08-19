@@ -28,9 +28,9 @@ dependencies = [
 
 [[package]]
 name = "rsshogi"
-version = "1.1.1"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbe4ff86f65136571a428311001992cb310aa2f75fdb42cd3ef4aadee2554477"
+checksum = "f3e09cd7db7cdef4f828d07b14ca705e3ba07e266898276a7e161725e0a1bed6"
 dependencies = [
  "log",
  "thiserror",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "rsshogi-nnue-mini"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "rsshogi",
  "rsshogi-usi",
