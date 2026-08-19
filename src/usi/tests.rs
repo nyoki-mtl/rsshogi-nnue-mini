@@ -174,10 +174,10 @@ fn try_rule_is_rejected() {
 fn manifest_uses_shogiarena_schema() {
     let manifest = tunable_manifest();
     assert!(manifest.contains("shogiarena.usi_tunables.v1"));
-    assert!(manifest.contains("SearchNullMoveReduction"));
+    assert!(manifest.contains("SearchNullMoveEvalDivisor"));
     assert!(manifest.contains("\"option\":\"FV_SCALE\""));
     assert!(!manifest.contains("EvalPawnValue"));
-    assert_eq!(manifest.matches("\"id\":").count(), 13);
+    assert_eq!(manifest.matches("\"id\":").count(), 14);
 }
 
 #[test]
@@ -196,8 +196,8 @@ fn usi_advertises_runtime_options() {
     assert!(!output.contains("option name EvalPawnValue"));
     #[cfg(feature = "tuning")]
     {
-        assert!(output.contains("option name SearchAspirationWindow type spin default 80"));
-        assert!(output.contains("option name SearchCheckBonus type spin default 4009"));
+        assert!(output.contains("option name SearchAspirationWindow type spin default 82"));
+        assert!(output.contains("option name SearchCheckBonus type spin default 4061"));
         assert!(output.contains("option name FV_SCALE type spin default 24"));
         assert!(output.contains("option name Clear Hash type button"));
     }
@@ -247,13 +247,8 @@ fn every_search_option_is_applied_to_the_next_snapshot() {
         ("SearchAspirationWindow", "81"),
         ("SearchReverseFutilityMargin", "141"),
         ("SearchFutilityMargin", "181"),
-        ("SearchNullMoveReduction", "3"),
-        ("SearchLmpDepth1Moves", "9"),
-        ("SearchLmpDepth2Moves", "13"),
-        ("SearchLmpDepth3Moves", "20"),
-        ("SearchLmrMinDepth", "4"),
-        ("SearchLmrMoveIndex", "5"),
-        ("SearchLmrReduction", "3"),
+        ("SearchNullMoveEvalDivisor", "210"),
+        ("SearchLmrDivisor", "240"),
         ("SearchQsearchDeltaMargin", "121"),
         ("SearchCheckBonus", "4001"),
     ];
@@ -265,9 +260,8 @@ fn every_search_option_is_applied_to_the_next_snapshot() {
 
     assert_ne!(engine.search_params, SearchParams::default());
     assert_eq!(engine.search_params.aspiration_window, 81);
-    assert_eq!(engine.search_params.null_move_reduction, 3);
-    assert_eq!(engine.search_params.lmp_quiet_limits, [9, 13, 20]);
-    assert_eq!(engine.search_params.lmr_reduction, 3);
+    assert_eq!(engine.search_params.null_move_eval_divisor, 210);
+    assert_eq!(engine.search_params.lmr_divisor, 240);
     assert_eq!(engine.search_params.check_ordering_bonus, 4001);
 }
 

@@ -1,17 +1,19 @@
 //! workerごとの探索状態と置換表keyの構成を担う。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rsshogi::board::Position;
-use rsshogi::types::{Move32, RepetitionState};
+use rsshogi::types::{Color, Move32, RepetitionState};
 
 use crate::eval::Evaluator;
 use crate::params::SearchParams;
 use crate::tt::TranspositionTable;
 
 use super::SearchLimits;
+use super::history::{CONTINUATION_PLIES, HistoryTables};
+use super::lmr::LmrReductions;
+use super::ordering::OrderingBuffer;
 
 /// TT keyのfingerprintで遡る手数の上限。
 const REPETITION_HISTORY_PLIES: usize = 16;
@@ -26,8 +28,15 @@ pub(crate) struct SearchContext {
     pub(super) pondering: Arc<AtomicBool>,
     pub(super) nodes: Arc<AtomicU64>,
     pub(super) table: Arc<TranspositionTable>,
-    pub(super) history: HashMap<Move32, i32>,
+    pub(super) history: HistoryTables,
     pub(super) killers: Vec<[Option<Move32>; 2]>,
+    /// paramsの`lmr_divisor`から探索開始時に事前計算した縮小テーブル。
+    pub(super) lmr: LmrReductions,
+    /// plyごとに再利用する並べ替えバッファ。毎ノードのVec確保を避ける。
+    pub(super) ordering: Vec<OrderingBuffer>,
+    /// plyごとに「そこで指した手のpiece-to index」。null moveは`None`。
+    /// continuation historyがこれを遡って直前の手を引く。
+    pub(super) continuation: Vec<Option<usize>>,
 }
 
 impl SearchContext {
@@ -69,10 +78,49 @@ impl SearchContext {
         self.nodes.load(Ordering::Relaxed)
     }
 
-    pub(super) fn record_quiet_cutoff(&mut self, mv: Move32, depth: u32, ply: u32) {
-        let bonus = i32::try_from(depth.saturating_mul(depth)).unwrap_or(i32::MAX).min(4_096);
-        let value = self.history.entry(mv).or_default();
-        *value = value.saturating_add(bonus).min(100_000);
+    /// plyのpoolから並べ替えバッファを借りる。pool外のplyには空を渡す。
+    pub(super) fn take_ordering_buffer(&mut self, ply: u32) -> OrderingBuffer {
+        self.ordering.get_mut(ply as usize).map(std::mem::take).unwrap_or_default()
+    }
+
+    /// 借りたバッファをplyのpoolへ返す。探索中断で返らない分は次に再確保される。
+    pub(super) fn recycle_ordering_buffer(&mut self, ply: u32, buffer: OrderingBuffer) {
+        if let Some(slot) = self.ordering.get_mut(ply as usize) {
+            *slot = buffer;
+        }
+    }
+
+    /// このplyで指した手を記録する。子ノードのcontinuation historyが読む。
+    pub(super) fn set_continuation(&mut self, ply: u32, entry: Option<usize>) {
+        if let Some(slot) = self.continuation.get_mut(ply as usize) {
+            *slot = entry;
+        }
+    }
+
+    /// 直前と2手前のpiece-to index。遡れない範囲は`None`。
+    pub(super) fn previous_continuations(&self, ply: u32) -> [Option<usize>; CONTINUATION_PLIES] {
+        std::array::from_fn(|offset| {
+            (ply as usize)
+                .checked_sub(offset + 1)
+                .and_then(|index| self.continuation.get(index).copied().flatten())
+        })
+    }
+
+    /// 静かな手のβカットを履歴テーブルとkillerへ記録する。
+    ///
+    /// `tried_quiets`は同じノードで先に試してalphaを上げられなかった静かな手で、
+    /// カットした手と同じ大きさのペナルティを受ける。
+    pub(super) fn record_quiet_cutoff(
+        &mut self,
+        stm: Color,
+        mv: Move32,
+        tried_quiets: &[Move32],
+        depth: u32,
+        ply: u32,
+    ) {
+        self.history.record_quiet_cutoff(stm, mv, tried_quiets, depth);
+        let previous = self.previous_continuations(ply);
+        self.history.record_continuation_cutoff(&previous, mv, tried_quiets, depth);
 
         if let Some(killers) = self.killers.get_mut(ply as usize)
             && killers[0] != Some(mv)

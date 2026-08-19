@@ -160,6 +160,7 @@ pub(super) fn search_root(
                 score: score_to_tt(score, 0),
                 bound: Bound::Lower,
                 best_move: Some(best_move),
+                static_eval: None,
             });
             return Some(RootOutcome { best_move, score, complete: true });
         }
@@ -171,6 +172,7 @@ pub(super) fn search_root(
         score: score_to_tt(alpha, 0),
         bound: if alpha > original_alpha { Bound::Exact } else { Bound::Upper },
         best_move: Some(best_move),
+        static_eval: None,
     });
     Some(RootOutcome { best_move, score: alpha, complete: true })
 }

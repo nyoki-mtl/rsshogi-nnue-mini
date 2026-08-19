@@ -1,6 +1,5 @@
 //! 探索テストが共有する文脈生成と実行の補助を提供する。
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, mpsc};
 
@@ -11,6 +10,8 @@ use crate::params::SearchParams;
 use crate::tt::TranspositionTable;
 
 use super::context::SearchContext;
+use super::history::HistoryTables;
+use super::lmr::LmrReductions;
 use super::{SearchControl, SearchEvent, SearchLimits, SearchResult, run};
 
 pub(crate) fn test_context(nodes: Arc<AtomicU64>, max_nodes: Option<u64>) -> SearchContext {
@@ -28,8 +29,13 @@ pub(crate) fn test_context(nodes: Arc<AtomicU64>, max_nodes: Option<u64>) -> Sea
         pondering: Arc::new(AtomicBool::new(false)),
         nodes,
         table: Arc::new(TranspositionTable::new(1)),
-        history: HashMap::new(),
+        history: HistoryTables::new(),
         killers: vec![[None; 2]; 20],
+        lmr: LmrReductions::new(SearchParams::default().lmr_divisor),
+        ordering: std::iter::repeat_with(Default::default)
+            .take(crate::position::MAX_SEARCH_PLY as usize + 2)
+            .collect(),
+        continuation: vec![None; crate::position::MAX_SEARCH_PLY as usize + 2],
     }
 }
 
@@ -43,6 +49,7 @@ pub(crate) fn run_result(position: Position, limits: SearchLimits, threads: usiz
         SearchControl::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))),
         sender,
         Arc::new(TranspositionTable::new(1)),
+        &mut Vec::new(),
         threads,
     );
     receiver

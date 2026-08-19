@@ -6,12 +6,7 @@ options:
   SearchAspirationWindow: 80
   SearchReverseFutilityMargin: 140
   SearchFutilityMargin: 180
-  SearchNullMoveReduction: 2
-  SearchLmpDepth1Moves: 8
-  SearchLmpDepth2Moves: 12
-  SearchLmpDepth3Moves: 18
-  SearchLmrMinDepth: 3
-  SearchLmrMoveIndex: 4
-  SearchLmrReduction: 1
+  SearchNullMoveEvalDivisor: 200
+  SearchLmrDivisor: 236
   SearchQsearchDeltaMargin: 120
   SearchCheckBonus: 4000

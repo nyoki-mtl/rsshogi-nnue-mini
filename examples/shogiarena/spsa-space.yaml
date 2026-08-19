@@ -10,13 +10,8 @@ select:
   - search_aspiration_window
   - search_reverse_futility_margin
   - search_futility_margin
-  - search_null_move_reduction
-  - search_lmp_depth1_moves
-  - search_lmp_depth2_moves
-  - search_lmp_depth3_moves
-  - search_lmr_min_depth
-  - search_lmr_move_index
-  - search_lmr_reduction
+  - search_null_move_eval_divisor
+  - search_lmr_divisor
   - search_qsearch_delta_margin
   - search_check_bonus
   - fv_scale

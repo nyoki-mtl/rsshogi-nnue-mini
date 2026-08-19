@@ -9,7 +9,7 @@ use rsshogi::board::Position;
 
 use crate::eval::Evaluator;
 use crate::params::SearchParams;
-use crate::search::{self, SearchControl, SearchEvent, SearchLimits};
+use crate::search::{self, HistoryTables, SearchControl, SearchEvent, SearchLimits};
 use crate::tt::TranspositionTable;
 
 use super::DEFAULT_HASH_MB;
@@ -44,6 +44,9 @@ impl SearchWorkerRuntime {
         let (commands, receiver) = mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
             let mut table = Arc::new(TranspositionTable::new(DEFAULT_HASH_MB));
+            // worker slotごとの履歴テーブル。対局中は`go`をまたいで持続し、
+            // `usinewgame`(Clear)で破棄する。長さの調整は`search::run`が行う。
+            let mut histories: Vec<HistoryTables> = Vec::new();
             while let Ok(command) = receiver.recv() {
                 match command {
                     WorkerCommand::Run(request) => {
@@ -63,12 +66,14 @@ impl SearchWorkerRuntime {
                                 control,
                                 request.events,
                                 Arc::clone(&table),
+                                &mut histories,
                                 request.threads,
                             );
                         }));
                     }
                     WorkerCommand::Clear(acknowledge) => {
                         table.clear();
+                        histories.clear();
                         let _ = acknowledge.send(());
                     }
                     WorkerCommand::ResizeHash(megabytes, acknowledge) => {

@@ -1,6 +1,6 @@
 name: local
 type: local
-slots: 16
-max_engines: 16
+slots: 24
+max_engines: 24
 tags: ["local", "spsa"]
 is_strict_host_key_checking: true
