@@ -11,11 +11,10 @@
 
 ## 評価ファイルを準備する
 
-Floodgateで使用した84エポックの`.rsnn`は、配布条件を確認したうえで、リリース時にGitHub Releasesの別assetとして配布する予定である。
-リリース前は対応する`.rsnn`を別途用意し、リポジトリ内の`eval/model.rsnn`へ置く。
-公開リポジトリには学習済みモデルも作成ツールも含まれない。
+Floodgateで使用した84エポックの`.rsnn`を[評価ファイルのRelease](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/model-84e-20260930)から取得し、リポジトリ内の`eval/model.rsnn`へ置く。
+公開リポジトリのソースコードには学習済みモデルも作成ツールも含まれない。
 別の場所に置く場合は、`isready`の前に`setoption name EvalPackage value <path>`を送る。
-期待するファイルのSHA-256を別途記録し、配置後に照合する。
+配置後にSHA-256が`a4a61c91f85a1ee1eb67cb7c6483c66fdb6ed7c2832d3184901e2faf89dfb398`と一致することを確認する。
 
 ```powershell
 Get-FileHash -Algorithm SHA256 ./eval/model.rsnn
@@ -24,7 +23,7 @@ Get-FileHash -Algorithm SHA256 ./eval/model.rsnn
 この章の直接実行では、作業ディレクトリはリポジトリのルートである。
 通常ビルドと調整用ビルドは、ともにその下の`eval/model.rsnn`を既定で読む。
 実行ファイルの場所を基準に探すわけではないため、GUIから起動する場合も作業ディレクトリを確認する。
-リリースから取得した評価ファイルを使う場合も、リリースに記載されたSHA-256と照合する。
+別の評価ファイルを使う場合は、そのファイルに対応するSHA-256と照合する。
 
 ## ビルドして起動する
 

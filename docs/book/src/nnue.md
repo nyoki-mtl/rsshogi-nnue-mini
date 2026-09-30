@@ -1,6 +1,6 @@
 # 評価関数（`.rsnn`）
 
-miniは512幅・Threatなし・PSQTありのSFNNv15 `.rsnn` packageを使用する。評価ファイルはGitには含めず、配布条件を確認したうえでリリース時に別assetとして配布する予定である。内蔵版をビルドした場合は、指定したpackageが実行ファイルに含まれる。
+miniは512幅・Threatなし・PSQTありのSFNNv15 `.rsnn` packageを使用する。84エポックの評価ファイルはGitには含めず、[評価ファイルのRelease](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/model-84e-20260930)で配布する。内蔵版をビルドした場合は、指定したpackageが実行ファイルに含まれる。
 
 ## 読み込み
 
@@ -63,7 +63,7 @@ cargo test pilot_package_evaluates_startpos -- --ignored
 miniでは本学習packageの5局面の評価値が参照実装と一致し、実モデルを使った6,000回のランダム操作（着手・取り消し・null手）で差分更新と全再計算の一致を確認した。
 この検査はFloodgateでの棋力やモバイル実機の速度を保証しない。
 
-リリース候補のpackageのSHA-256は`a4a61c91f85a1ee1eb67cb7c6483c66fdb6ed7c2832d3184901e2faf89dfb398`である。
+公開したpackageのSHA-256は`a4a61c91f85a1ee1eb67cb7c6483c66fdb6ed7c2832d3184901e2faf89dfb398`である。
 同じpackageを用意した場合、mini側の実モデル検証を次で再実行できる。
 
 ```powershell

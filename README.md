@@ -21,8 +21,7 @@ CSA接続には[rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)、ロー�
 
 Rust 1.95以降を使います。
 通常版には評価ファイルを同梱していません。
-Floodgateで使用した84エポックの`.rsnn`は、配布条件を確認したうえで、リリース時にGitHub Releasesの別assetとして配布する予定です。リリース前は対応する512幅・Threatなし・PSQTありのSFNNv15 `.rsnn`を別途用意してください。
-このリポジトリには学習済みモデルも作成ツールも含まれません。モデルがない状態では対局できません。
+Floodgateで使用した84エポックの`.rsnn`は、[評価ファイルのRelease](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/model-84e-20260930)から取得できます。ソースコードには学習済みモデルも作成ツールも含まれません。モデルがない状態では対局できません。
 評価ファイルを`eval/model.rsnn`へ配置するか、USIの`EvalPackage`にファイルのパスを指定してください。
 相対パスは実行時の作業ディレクトリを基準に読み込みます。
 以下はWindowsで、リポジトリのルートから通常版を実行する例です。
