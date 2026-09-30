@@ -4,11 +4,9 @@ alpha-betaの並列化は難しい。
 cutoffは「先に読んだ手の結果」に依存するので、木を機械的に分割して配ると、片方の結果を待たずに読んだ枝が無駄になる。
 木の分割を精密に管理する並列化もあるが、実装の複雑さは探索本体に匹敵する。
 
-**Lazy SMP**はこの問題を、調整をほぼ放棄することで回避する。
-全workerに同じrootを最初から読ませ、共有するのは置換表だけにする。
-あるworkerが読み終えた部分木の結果は置換表を経由して他のworkerへ届き、後から同じ局面に来たworkerはprobe一発で素通りする。
-workerどうしの合意も分割も要らない。
-「怠惰」の名のとおり設計は素朴だが、置換表が実質的な作業分配器として機能する。
+**Lazy SMP**は、複数のワーカーに同じルート局面を探索させ、置換表を通じて探索結果を共有する方式である。
+あるワーカーが保存した結果を別のワーカーが参照し、深さと境界の条件が合えば再探索を省ける。
+探索木を明示的に分割しないため、ワーカー間で重複して読む部分も残る。
 
 <svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" style="max-width: 720px; width: 100%; height: auto; font-family: sans-serif;">
   <defs>
@@ -51,8 +49,9 @@ workerどうしの合意も分割も要らない。
 USIへの`info`と最終結果を公開するのはmainだけで、helperの成果は共有置換表への書き込みとしてだけ現れる。
 soft deadlineでiterationの新規開始をやめる判断もmainだけが行い、helperは停止の合図まで置換表を埋め続ける。
 
-各workerは局面、NNUE accumulator、history、killerを個別に持ち、共有するのは置換表、node counter、cancelの3つに限る。
-共有状態を減らすほど、並列化のbugが入り込む面が狭くなる。
+各ワーカーは局面、NNUE accumulator、history、killerを個別に持つ。
+共有するのは置換表、ノードカウンタ、停止フラグ、ponder状態と締切である。
+ヘルパーの起動を知らせるフラグも共有するが、局面と評価の更新は各ワーカー内で完結する。
 
 helperがmainと完全に同じ順で読むと、同じ枝を同時に読む重複が最大になる。
 そこでhelperはroot moveの開始位置をworker番号だけ回転させ、読む順をずらす。
@@ -63,7 +62,7 @@ helperの開始はmainがdepth 1を完了した後で、最初のiterationの`be
 ## 終了とpanicの回収
 
 mainの探索が終わると、全helperへcancelを送り、joinしてから完了結果を一度だけ送る。
-mainまたはhelperがpanicした場合も、先に全helperを停止・joinしてからcoordinator境界へ伝播させる。
+mainまたはhelperがpanicした場合も、先に全helperを停止してjoinし、coordinator境界へ伝播させる。
 workerを残したまま次の探索を始めると、前の探索のthreadが共有置換表を書き続ける。
 
 ## 効果を測る

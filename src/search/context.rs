@@ -7,16 +7,16 @@ use rsshogi::board::Position;
 use rsshogi::types::{Color, Move32, RepetitionState};
 
 use crate::eval::Evaluator;
+use crate::nnue::MAX_NNUE_EVAL;
 use crate::params::SearchParams;
+use crate::position::MAX_SEARCH_PLY;
 use crate::tt::TranspositionTable;
 
-use super::SearchLimits;
 use super::history::{CONTINUATION_PLIES, HistoryTables};
 use super::lmr::LmrReductions;
 use super::ordering::OrderingBuffer;
+use super::{MAX_QPLY, SearchLimits};
 
-/// TT keyのfingerprintで遡る手数の上限。
-const REPETITION_HISTORY_PLIES: usize = 16;
 const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
 
@@ -37,9 +37,50 @@ pub(crate) struct SearchContext {
     /// plyごとに「そこで指した手のpiece-to index」。null moveは`None`。
     /// continuation historyがこれを遡って直前の手を引く。
     pub(super) continuation: Vec<Option<usize>>,
+    /// plyごとに、singularの判定探索で読まない手。判定探索の間だけ設定する。
+    pub(super) excluded: Vec<Option<Move32>>,
+    /// 実行中のiterationのdepth。延長が際限なく続かないよう、延長できるplyを制限する。
+    pub(super) root_depth: u32,
+}
+
+/// 全workerが共有する停止・ponder状態、node数、置換表。
+#[derive(Clone)]
+pub(super) struct SharedSearch {
+    pub(super) cancel: Arc<AtomicBool>,
+    pub(super) pondering: Arc<AtomicBool>,
+    pub(super) nodes: Arc<AtomicU64>,
+    pub(super) table: Arc<TranspositionTable>,
 }
 
 impl SearchContext {
+    pub(super) fn new(
+        evaluator: Evaluator,
+        params: SearchParams,
+        limits: SearchLimits,
+        shared: SharedSearch,
+        history: HistoryTables,
+    ) -> Self {
+        let SharedSearch { cancel, pondering, nodes, table } = shared;
+        let killer_count = limits.max_depth as usize + MAX_QPLY as usize + 4;
+        let per_ply = MAX_SEARCH_PLY as usize + 2;
+        Self {
+            evaluator,
+            lmr: LmrReductions::new(params.lmr_divisor),
+            params,
+            limits,
+            cancel,
+            pondering,
+            nodes,
+            table,
+            history,
+            killers: vec![[None; 2]; killer_count],
+            ordering: std::iter::repeat_with(Default::default).take(per_ply).collect(),
+            continuation: vec![None; per_ply],
+            excluded: vec![None; per_ply],
+            root_depth: 0,
+        }
+    }
+
     pub(super) fn enter_node(&mut self) -> Option<()> {
         if self.cancel.load(Ordering::Relaxed) || self.hard_deadline_expired() {
             return None;
@@ -68,14 +109,28 @@ impl SearchContext {
             && self.limits.deadline.as_ref().is_some_and(|deadline| deadline.hard_expired())
     }
 
-    /// ponder中は保留し、softな締切を過ぎていれば新しいiterationを始めない。
-    pub(super) fn should_skip_new_iteration(&self) -> bool {
+    /// ponder中は保留し、`scale`倍したsoftな締切を過ぎていれば新しいiterationを始めない。
+    pub(super) fn should_skip_new_iteration(&self, scale: f64) -> bool {
         !self.pondering.load(Ordering::Acquire)
-            && self.limits.deadline.as_ref().is_some_and(|deadline| deadline.soft_expired())
+            && self
+                .limits
+                .deadline
+                .as_ref()
+                .is_some_and(|deadline| deadline.scaled_soft_expired(scale))
     }
 
     pub(super) fn node_count(&self) -> u64 {
         self.nodes.load(Ordering::Relaxed)
+    }
+
+    /// 生の静的評価へcorrection historyの補正を足す。
+    ///
+    /// 補正後も通常評価の範囲を守り、詰みscoreとTTの距離補正へ混入させない。
+    /// TTへ保存するのは補正前の値で、補正は枝刈りとstand patの判定にだけ効かせる。
+    pub(super) fn corrected_eval(&self, position: &Position, raw: i32) -> i32 {
+        let correction =
+            self.history.corrections.correction(position, self.params.correction_apply_max);
+        (raw + correction).clamp(-MAX_NNUE_EVAL, MAX_NNUE_EVAL)
     }
 
     /// plyのpoolから並べ替えバッファを借りる。pool外のplyには空を渡す。
@@ -133,16 +188,13 @@ impl SearchContext {
 
 /// 局面に、千日手判定の結果を左右する状態だけを足したTT key。
 ///
-/// `rsshogi`の探索用千日手判定は`min(ply, plies_from_null, 16)`手までしか遡らない。
-/// そのため、遡れる幅、連続王手の長さ、すでに数えた同一局面の回数がkeyに必要になる。
-/// 一方で窓の中身、つまりどの経路でこの局面へ来たかはkeyへ入れない。
+/// このnodeで判定済みの同一局面の回数と種別、連続王手の長さをkeyへ混ぜる。
+/// 探索plyは混ぜない。混ぜるとrootが進んだ次の`go`で同じ局面を引けなくなる。
+/// どの経路でこの局面へ来たかもkeyへ入れない。
 /// 入れると手順前後で合流した同一局面が別entryになり、TTがtranspositionを共有しなくなる。
 /// 代わりに、祖先集合が違う二つの経路が同じentryを共有し得るという通常のGHIを受け入れる。
-pub(super) fn tt_key(position: &Position, ply: u32, max_moves_to_draw: u32) -> u64 {
-    let scan_window =
-        (ply as usize).min(usize::from(position.plies_from_null())).min(REPETITION_HISTORY_PLIES);
+pub(super) fn tt_key(position: &Position, max_moves_to_draw: u32) -> u64 {
     let mut fingerprint = FNV_OFFSET_BASIS;
-    mix_tt_component(&mut fingerprint, scan_window as u64);
     mix_tt_component(
         &mut fingerprint,
         u64::from_ne_bytes(i64::from(position.repetition_times()).to_ne_bytes()),
@@ -196,9 +248,9 @@ mod tests {
             "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 101",
         )
         .expect("valid position");
-        assert_eq!(tt_key(&early, 0, 0), tt_key(&late, 0, 0));
-        assert_ne!(tt_key(&early, 0, 100), tt_key(&late, 0, 100));
-        assert_ne!(tt_key(&early, 0, 100), tt_key(&early, 0, 200));
+        assert_eq!(tt_key(&early, 0), tt_key(&late, 0));
+        assert_ne!(tt_key(&early, 100), tt_key(&late, 100));
+        assert_ne!(tt_key(&early, 100), tt_key(&early, 200));
     }
 
     #[test]
@@ -217,8 +269,8 @@ mod tests {
 
         assert_eq!(direct.key(), transposed.key(), "the two orders must transpose");
         assert_eq!(
-            tt_key(&direct, 3, 0),
-            tt_key(&transposed, 3, 0),
+            tt_key(&direct, 0),
+            tt_key(&transposed, 0),
             "手順前後で合流した同一局面はTT entryを共有する"
         );
     }
@@ -239,9 +291,7 @@ mod tests {
         assert_eq!(history_rich.key(), history_fresh.key());
         assert_eq!(history_rich.repetition_state(), RepetitionState::None);
         assert_eq!(history_fresh.repetition_state(), RepetitionState::None);
-        assert_ne!(tt_key(&history_rich, 0, 0), tt_key(&history_fresh, 0, 0));
-        assert_ne!(tt_key(&history_rich, 8, 0), tt_key(&history_fresh, 8, 0));
-        assert_ne!(tt_key(&history_rich, 0, 0), tt_key(&history_rich, 8, 0));
+        assert_ne!(tt_key(&history_rich, 0), tt_key(&history_fresh, 0));
 
         for text in cycle {
             let rich_move = board::move_from_usi(&history_rich, text).expect("legal rich move");

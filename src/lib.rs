@@ -1,7 +1,9 @@
 //! NNUE対応の小さなUSI将棋エンジン。
 //!
-//! 外部へ公開するのはUSIのentry pointだけで、内部moduleはcrate内から
+//! USIのentry pointと`.rsnn` package検証器を公開し、内部moduleはcrate内から
 //! 所有者のpathで参照する。
+
+pub use nnue::RsnnPackage;
 
 mod eval;
 mod nnue;

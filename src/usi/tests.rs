@@ -15,7 +15,6 @@ use crate::params::tunable_manifest;
 use crate::position::MAX_ROOT_GAME_PLY;
 
 use super::DEFAULT_ENTERING_KING_RULE;
-#[cfg(not(feature = "tuning"))]
 use super::DEFAULT_EVAL_FILE;
 use super::engine::Engine;
 use super::output::write_info;
@@ -172,12 +171,12 @@ fn try_rule_is_rejected() {
 #[cfg(feature = "tuning")]
 #[test]
 fn manifest_uses_shogiarena_schema() {
-    let manifest = tunable_manifest();
+    let manifest = tunable_manifest(crate::nnue::DEFAULT_FV_SCALE);
     assert!(manifest.contains("shogiarena.usi_tunables.v1"));
     assert!(manifest.contains("SearchNullMoveEvalDivisor"));
     assert!(manifest.contains("\"option\":\"FV_SCALE\""));
     assert!(!manifest.contains("EvalPawnValue"));
-    assert_eq!(manifest.matches("\"id\":").count(), 14);
+    assert_eq!(manifest.matches("\"id\":").count(), 41);
 }
 
 #[test]
@@ -188,17 +187,18 @@ fn usi_advertises_runtime_options() {
 
     let output = output(&writer);
     assert!(output.contains("option name USI_Ponder type check default false"));
+    assert!(
+        output
+            .contains(&format!("option name EvalPackage type string default {DEFAULT_EVAL_FILE}"))
+    );
     assert!(output.contains("option name USI_Hash type spin default 16 min 1 max 1024"));
     assert!(output.contains("option name Threads type spin default 1 min 1 max 16"));
     assert!(output.contains("option name MoveOverhead type spin default 500 min 0 max 5000"));
-    assert!(!output.contains("option name UseNNUE"));
-    assert!(!output.contains("option name EvalFile"));
-    assert!(!output.contains("option name EvalPawnValue"));
     #[cfg(feature = "tuning")]
     {
-        assert!(output.contains("option name SearchAspirationWindow type spin default 82"));
-        assert!(output.contains("option name SearchCheckBonus type spin default 4061"));
-        assert!(output.contains("option name FV_SCALE type spin default 24"));
+        assert!(output.contains("option name SearchAspirationWindow type spin default 83"));
+        assert!(output.contains("option name SearchCheckBonus type spin default 4269"));
+        assert!(output.contains("option name FV_SCALE type spin default 21"));
         assert!(output.contains("option name Clear Hash type button"));
     }
     #[cfg(not(feature = "tuning"))]
@@ -224,12 +224,9 @@ fn normal_build_does_not_answer_tunable_manifest_requests() {
 fn normal_build_keeps_nnue_and_tuning_values_fixed() {
     let mut engine = Engine::new();
     let mut writer = Vec::new();
-    for command in [
-        "setoption name UseNNUE value false",
-        "setoption name EvalFile value other/nn.bin",
-        "setoption name FV_SCALE value 25",
-        "setoption name SearchAspirationWindow value 81",
-    ] {
+    for command in
+        ["setoption name FV_SCALE value 25", "setoption name SearchAspirationWindow value 85"]
+    {
         engine.handle_line(command, &mut writer).expect("hidden option should be ignored");
     }
 
@@ -270,7 +267,7 @@ fn nnue_load_failure_does_not_fall_back_silently() {
     let mut engine = Engine::new();
     let mut writer = Vec::new();
     engine.material_test_mode = false;
-    engine.eval_file = "_missing/nn.bin".to_owned();
+    engine.eval_file = "_missing/model.rsnn".to_owned();
     engine.handle_line("isready", &mut writer).expect("isready should respond");
     engine.handle_line("go depth 1", &mut writer).expect("go should respond");
 
@@ -281,6 +278,45 @@ fn nnue_load_failure_does_not_fall_back_silently() {
     let lines = output(&writer).lines().collect::<Vec<_>>();
     let bestmove = lines.iter().position(|line| *line == "bestmove resign").expect("bestmove");
     assert!(lines[bestmove - 1].starts_with("info depth 0 "));
+}
+
+#[test]
+fn eval_package_option_changes_the_load_path() {
+    let mut engine = Engine::new();
+    let mut writer = Vec::new();
+    engine
+        .handle_line("setoption name EvalPackage value _missing/other.rsnn", &mut writer)
+        .expect("set package path");
+    assert_eq!(engine.eval_file, "_missing/other.rsnn");
+    engine.material_test_mode = false;
+    engine.handle_line("isready", &mut writer).expect("missing package fails closed");
+    assert!(!output(&writer).contains("readyok"));
+    assert!(output(&writer).contains("NNUE load error:"));
+}
+
+#[cfg(feature = "embedded-rsnn")]
+#[test]
+fn embedded_package_is_the_default_and_can_be_selected_again() {
+    let mut engine = Engine::new();
+    engine.material_test_mode = false;
+    let mut writer = Vec::new();
+    engine.handle_line("isready", &mut writer).expect("embedded package should load");
+    assert!(output(&writer).contains("loaded mobile .rsnn: @default digest="));
+    assert!(output(&writer).lines().any(|line| line == "readyok"));
+
+    writer.clear();
+    engine
+        .handle_line("setoption name EvalPackage value _missing/other.rsnn", &mut writer)
+        .expect("set missing package");
+    engine.handle_line("isready", &mut writer).expect("missing package should fail");
+    assert!(!output(&writer).lines().any(|line| line == "readyok"));
+
+    writer.clear();
+    engine
+        .handle_line("setoption name EvalPackage value @default", &mut writer)
+        .expect("select embedded package");
+    engine.handle_line("isready", &mut writer).expect("embedded package should reload");
+    assert!(output(&writer).lines().any(|line| line == "readyok"));
 }
 
 #[test]

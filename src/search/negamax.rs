@@ -1,18 +1,38 @@
 //! 主探索のnegamaxと、そこに属する枝刈りの判定を担う。
 
-use rsshogi::board::{Move32List, Position, generate_legal_all_move32};
+use rsshogi::board::{Captures, Legal, Move32List, Position, generate_moves_move32};
 
 use crate::position::MAX_SEARCH_PLY;
+use crate::see::static_exchange_eval;
 use crate::tt::{Bound, TtEntry};
 
 use super::context::{SearchContext, tt_key};
 use super::history::{TriedQuiets, piece_to_index};
-use super::ordering::{MovePicker, OrderedMove};
+use super::lmr::lmr_reduction;
+use super::ordering::{MovePicker, OrderedMove, OrderingInputs, is_legal_generated};
+use super::pruning::{
+    iir_depth, null_move_reduction_amount, should_futility_prune_quiets, should_prune_by_history,
+    should_prune_capture_by_see, should_prune_late_quiet, should_prune_late_quiet_drop,
+    should_reverse_futility_prune, should_try_null_move, should_try_singular,
+};
 use super::qsearch::{qsearch, structural_leaf_score};
 use super::score::{
-    bound_after_search, declaration_score, score_from_tt, score_to_tt, terminal_score,
+    bound_after_search, declaration_score, score_from_tt, score_to_tt, terminal_score, tt_cutoff,
 };
-use super::{CaptureSee, INF, MATE, MATE_TT_THRESHOLD};
+use super::{INF, MATE, MATE_TT_THRESHOLD};
+
+/// 子局面を探索し、手番側から見た値へ符号を戻す。
+pub(super) fn search_child(
+    position: &mut Position,
+    depth: u32,
+    alpha: i32,
+    beta: i32,
+    ply: u32,
+    static_eval_history: [Option<i32>; 2],
+    context: &mut SearchContext,
+) -> Option<i32> {
+    negamax(position, depth, -beta, -alpha, ply, static_eval_history, context).map(|v| -v)
+}
 
 pub(super) fn negamax(
     position: &mut Position,
@@ -36,36 +56,48 @@ pub(super) fn negamax(
         return Some(score);
     }
     if ply >= MAX_SEARCH_PLY {
-        return Some(structural_leaf_score(position, ply, &context.evaluator));
+        return Some(structural_leaf_score(position, ply, &mut context.evaluator));
     }
 
-    let key = tt_key(position, ply, context.limits.max_moves_to_draw);
+    // singularの判定探索では、TT moveを除いた残りの手だけを読む。
+    // このnodeの結果はTT moveを含む本来の値ではないので、TTでは打ち切らず保存もしない。
+    let excluded = context.excluded.get(ply as usize).copied().flatten();
+    let key = tt_key(position, context.limits.max_moves_to_draw);
     let tt_entry = context.table.probe(key);
     let tt_move = tt_entry.and_then(|entry| entry.best_move);
+    // PV nodeではTTで打ち切らない。打ち切るとPVが途中で切れ、
+    // 以前の窓で得た値が千日手の判定などを経ずにPV上へ戻ってくる。
     if let Some(entry) = tt_entry
         && entry.depth >= depth
+        && !pv_node
+        && excluded.is_none()
+        && let Some(score) = tt_cutoff(&entry, ply, &mut alpha, beta)
     {
-        let score = score_from_tt(entry.score, ply);
-        match entry.bound {
-            Bound::Exact => return Some(score),
-            Bound::Lower if score >= beta => return Some(score),
-            Bound::Upper if score <= alpha => return Some(score),
-            Bound::Lower => alpha = alpha.max(score),
-            Bound::Upper => {}
-        }
+        return Some(score);
     }
     let search_alpha = alpha;
     // IIR: TT moveの無い深いノードは良い並べ替えを欠いて高くつくので、
     // 1浅く探索して次のvisitへTT moveを残す。
-    let depth = iir_depth(depth, tt_move.is_some());
+    let depth = if excluded.is_some() {
+        depth
+    } else {
+        iir_depth(depth, tt_move.is_some(), context.params.iir_min_depth)
+    };
 
-    // 合法手はheapを使わないstack上のリストへ直接生成する。
-    let mut move_list = Move32List::new();
-    generate_legal_all_move32(position, &mut move_list);
-    if move_list.as_slice().is_empty() {
-        return Some(-MATE + ply as i32);
-    }
+    // TT moveは別の局面のentryと衝突し得るので、合法なときだけ使う。
+    let tt_move = tt_move.filter(|&mv| position.is_legal_move32(mv));
     let in_check = position.is_in_check();
+    // 王手されていないnodeでは、手を段階ごとに必要になった時点で生成する(MovePicker)。
+    // 王手回避と、除外手つきの判定探索では全合法手を先に生成する。
+    // 合法手はheapを使わないstack上のリストへ直接生成する。
+    let staged = !in_check && excluded.is_none();
+    let mut move_list = Move32List::new();
+    if !staged {
+        generate_moves_move32::<Legal>(position, &mut move_list);
+        if move_list.as_slice().is_empty() {
+            return Some(-MATE + ply as i32);
+        }
+    }
     // TT entryに静的評価が残っていれば、高価な再評価を省いてそれを使う。
     // TTへ書き戻すのはこの生の値で、補正は枝刈り判定にだけ効かせる。
     let raw_static_eval = if in_check {
@@ -76,43 +108,36 @@ pub(super) fn negamax(
             .or_else(|| Some(context.evaluator.evaluate(position)))
     };
     // correction history: 同じ特徴を持つ局面で観測した「探索結果 - 静的評価」を足し戻す。
-    let static_eval = raw_static_eval.map(|raw| {
-        raw + context.history.corrections.correction(position, context.params.correction_apply_max)
-    });
+    let static_eval = raw_static_eval.map(|raw| context.corrected_eval(position, raw));
     // improvingは「2手前の同手番より評価が良い」。どちらか欠けていれば
     // improving扱いにしない(LMP・RFPの判定と共通)。
     let improving = static_eval
         .zip(static_eval_history[0])
         .is_some_and(|(current, previous)| current > previous);
-    if let Some(eval) = static_eval
-        && should_reverse_futility_prune(
-            depth,
-            pv_node,
-            improving,
-            eval,
-            beta,
-            context.params.reverse_futility_margin,
-        )
+    let child_static_eval_history = [static_eval_history[1], static_eval];
+    if excluded.is_none()
+        && let Some(eval) = static_eval
+        && should_reverse_futility_prune(depth, pv_node, improving, eval, beta, &context.params)
     {
         return Some(eval);
     }
-    if let Some(eval) = static_eval
+    if excluded.is_none()
+        && let Some(eval) = static_eval
         && should_try_null_move(zero_window, in_check, eval, beta, position.plies_from_null())
         && position.try_apply_search_null_move().is_ok()
     {
         context.set_continuation(ply, None);
-        let reduction =
-            null_move_reduction_amount(depth, eval, beta, context.params.null_move_eval_divisor);
+        let reduction = null_move_reduction_amount(depth, eval, beta, &context.params);
         let child_depth = depth.saturating_sub(1 + reduction);
-        let child = negamax(position, child_depth, -beta, -beta + 1, ply + 1, [None; 2], context)
-            .map(|v| -v);
+        let child =
+            search_child(position, child_depth, beta - 1, beta, ply + 1, [None; 2], context);
         position.undo_search_null_move().expect("a search null move must be undoable");
         let score = child?;
         if score >= beta {
             // 深いノードのnull cutは千日手・受け無し形の誤検出が高くつくので、
             // nullなしの検証探索が同じくβを超えることを確かめてからカットする。
             // 検証は同一ノードのdepth - reduction再帰で、深さが真に減るので停止する。
-            let verified = if depth >= 12 {
+            let verified = if depth as i32 >= context.params.null_move_verify_depth {
                 negamax(
                     position,
                     depth.saturating_sub(reduction),
@@ -138,28 +163,124 @@ pub(super) fn negamax(
             }
         }
     }
-    let killers = context.killers.get(ply as usize).copied().unwrap_or([None; 2]);
+    // ProbCut: βを大きく超える捕獲が浅い探索でも超えるなら、このnodeもβを超えると見なす。
+    // 候補はSEEで上乗せ分を賄える捕獲に限り、静止探索で当たりを付けてから浅く確かめる。
+    if !pv_node
+        && !in_check
+        && excluded.is_none()
+        && depth >= context.params.probcut_min_depth as u32
+        && beta.abs() < MATE_TT_THRESHOLD
+        && let Some(eval) = static_eval
+    {
+        let probcut_beta = beta + context.params.probcut_margin;
+        let tt_denies = tt_entry.is_some_and(|entry| {
+            matches!(entry.bound, Bound::Upper | Bound::Exact)
+                && entry.depth + 3 >= depth
+                && score_from_tt(entry.score, ply) < probcut_beta
+        });
+        if !tt_denies {
+            let eval_params = context.evaluator.params();
+            // ProbCutは王手されていないnodeでだけ試すので、候補は合法な捕獲だけ生成する。
+            let mut captures = Move32List::new();
+            generate_moves_move32::<Captures>(position, &mut captures);
+            for mv in captures.as_slice().iter().copied() {
+                if !is_legal_generated(position, mv)
+                    || !static_exchange_eval(position, mv, eval_params)
+                        .is_some_and(|see| see >= probcut_beta - eval)
+                {
+                    continue;
+                }
+                position.apply_move32(mv);
+                context.evaluator.advance(position, mv);
+                context.set_continuation(ply, Some(piece_to_index(mv)));
+                let mut probe =
+                    qsearch(position, -probcut_beta, -probcut_beta + 1, ply + 1, 0, context)
+                        .map(|v| -v);
+                if probe.is_some_and(|score| score >= probcut_beta) {
+                    probe = search_child(
+                        position,
+                        depth + 1 - context.params.probcut_min_depth as u32,
+                        probcut_beta - 1,
+                        probcut_beta,
+                        ply + 1,
+                        child_static_eval_history,
+                        context,
+                    );
+                }
+                position.undo_move32(mv).expect("a searched move must be undoable");
+                context.evaluator.undo();
+                let score = probe?;
+                if score >= probcut_beta {
+                    context.table.store(TtEntry {
+                        key,
+                        depth: depth + 2 - context.params.probcut_min_depth as u32,
+                        score: score_to_tt(score, ply),
+                        bound: Bound::Lower,
+                        best_move: Some(mv),
+                        static_eval: raw_static_eval,
+                    });
+                    return Some(score);
+                }
+            }
+        }
+    }
+    // singular extension: TT moveを除いた手がどれもTTの値から十分下回るなら、
+    // TT moveだけが局面を支えている。その手を1手深く読む。
+    // 除いた手でもβを超えるなら、複数の手がβを超えるのでこのnodeを打ち切る(multi-cut)。
+    let mut singular_extension = false;
+    if excluded.is_none()
+        && let Some(entry) = tt_entry
+        && let Some(tt_mv) = tt_move
+        && should_try_singular(
+            depth,
+            ply,
+            context.root_depth,
+            &entry,
+            context.params.singular_min_depth,
+        )
+    {
+        let singular_beta =
+            score_from_tt(entry.score, ply) - context.params.singular_margin * depth as i32;
+        context.excluded[ply as usize] = Some(tt_mv);
+        let value = negamax(
+            position,
+            (depth - 1) / 2,
+            singular_beta - 1,
+            singular_beta,
+            ply,
+            static_eval_history,
+            context,
+        );
+        context.excluded[ply as usize] = None;
+        let value = value?;
+        if value < singular_beta {
+            singular_extension = true;
+        } else if singular_beta >= beta && !pv_node {
+            return Some(singular_beta);
+        }
+    }
+    let inputs = OrderingInputs {
+        eval_params: context.evaluator.params(),
+        search_params: context.params,
+        killers: context.killers.get(ply as usize).copied().unwrap_or([None; 2]),
+        previous: context.previous_continuations(ply),
+    };
     let ordering_buffer = context.take_ordering_buffer(ply);
-    let previous_continuations = context.previous_continuations(ply);
-    let mut picker = MovePicker::new(
-        position,
-        move_list.as_slice(),
-        context.evaluator.params(),
-        tt_move,
-        killers,
-        &context.history,
-        &previous_continuations,
-        context.params,
-        ordering_buffer,
-    );
+    let mut picker = if staged {
+        MovePicker::staged(tt_move, inputs, ordering_buffer)
+    } else {
+        MovePicker::new(
+            position,
+            move_list.as_slice(),
+            tt_move,
+            inputs,
+            &context.history,
+            ordering_buffer,
+        )
+    };
 
-    let futility = should_futility_prune_quiets(
-        depth,
-        in_check,
-        static_eval,
-        alpha,
-        context.params.futility_margin,
-    );
+    let futility =
+        should_futility_prune_quiets(depth, in_check, static_eval, alpha, &context.params);
     let mut best_score = -INF;
     let mut best_move = None;
     let mut best_is_quiet = false;
@@ -167,25 +288,20 @@ pub(super) fn negamax(
     let mut eligible_drops_seen = 0;
     let mut pruned_move = false;
     let mut reduced_move_without_research = false;
-    let child_static_eval_history = [static_eval_history[1], static_eval];
     // このノードで試したがalphaを上げられなかった静かな手。βカット時にペナルティを受ける。
     let mut tried_quiets = TriedQuiets::new();
 
     let mut yielded = 0usize;
-    while let Some(ordered) = picker.next(position) {
+    while let Some(ordered) = picker.next(position, &context.history) {
+        if Some(ordered.mv) == excluded {
+            continue;
+        }
         let index = yielded;
         yielded += 1;
         let OrderedMove { mv, metadata, see, quiet, history_score } = ordered;
         // 捕獲のSEEはMovePickerが取り出し時に払っているので、ここでの判定は
         // 追加計算を伴わない。大きく損な捕獲は浅いnon-PVノードでは読まない。
-        if index > 0
-            && should_prune_capture_by_see(
-                depth,
-                pv_node,
-                in_check,
-                see,
-                context.params.see_prune_margin,
-            )
+        if index > 0 && should_prune_capture_by_see(depth, pv_node, in_check, see, &context.params)
         {
             pruned_move = true;
             continue;
@@ -200,13 +316,7 @@ pub(super) fn negamax(
         if index > 0
             && quiet
             && !gives_check
-            && should_prune_by_history(
-                depth,
-                pv_node,
-                in_check,
-                history_score,
-                context.params.history_prune_margin,
-            )
+            && should_prune_by_history(depth, pv_node, in_check, history_score, &context.params)
         {
             pruned_move = true;
             continue;
@@ -222,17 +332,18 @@ pub(super) fn negamax(
                 in_check,
                 improving,
                 eligible_drops_seen,
-                context.params.drop_lmp_divisor,
+                &context.params,
             )
         } else {
-            should_prune_late_quiet(
-                depth,
-                pv_node,
-                in_check,
-                improving,
-                eligible_quiets_seen,
-                lmp_eligible,
-            )
+            lmp_eligible
+                && should_prune_late_quiet(
+                    depth,
+                    pv_node,
+                    in_check,
+                    improving,
+                    eligible_quiets_seen,
+                    &context.params,
+                )
         };
         if lmp_eligible {
             eligible_quiets_seen += 1;
@@ -244,80 +355,83 @@ pub(super) fn negamax(
             pruned_move = true;
             continue;
         }
+        let child_depth = depth - 1 + u32::from(singular_extension && Some(mv) == tt_move);
         position.apply_move32(mv);
         context.evaluator.advance(position, mv);
         context.set_continuation(ply, Some(piece_to_index(mv)));
         let mut reduced_without_research = false;
         let child = if index == 0 {
-            negamax(position, depth - 1, -beta, -alpha, ply + 1, child_static_eval_history, context)
-                .map(|v| -v)
+            search_child(
+                position,
+                child_depth,
+                alpha,
+                beta,
+                ply + 1,
+                child_static_eval_history,
+                context,
+            )
         } else {
             // 対数LMR: 遅い静かな手ほど、深い局面ほど大きく縮小する。
+            // 王手になる静かな手は、応手が限られて結論が早く出やすいので1段浅く縮める。
             let reduction = if quiet
                 && !in_check
-                && !gives_check
                 && depth >= 2
-                && index >= 2 + usize::from(pv_node)
+                && index >= context.params.lmr_min_index as usize + usize::from(pv_node)
             {
-                lmr_reduction(
+                (lmr_reduction(
                     context.lmr.base(depth, index),
                     pv_node,
                     improving,
                     history_score,
                     depth,
-                )
+                    &context.params,
+                ) - i32::from(gives_check) * context.params.check_lmr_offset)
+                    .max(0)
+            } else if see.is_some_and(|exchange| exchange < 0)
+                && !in_check
+                && depth >= 3
+                && index >= context.params.lmr_min_index as usize
+            {
+                // SEEで損と分かっている捕獲も、遅い手なら静かな手より1段浅く縮める。
+                // 縮めた探索がalphaを超えれば、通常どおり全深さで読み直す。
+                (context.lmr.base(depth, index) - context.params.bad_capture_lmr_offset)
+                    .clamp(1, depth as i32 - 2)
             } else {
                 0
             };
             let reduced = reduction > 0;
-            let mut scout = if reduced {
-                negamax(
-                    position,
-                    depth - 1 - reduction as u32,
-                    -alpha - 1,
-                    -alpha,
-                    ply + 1,
-                    child_static_eval_history,
-                    context,
-                )
-                .map(|v| -v)
-            } else {
-                negamax(
-                    position,
-                    depth - 1,
-                    -alpha - 1,
-                    -alpha,
-                    ply + 1,
-                    child_static_eval_history,
-                    context,
-                )
-                .map(|v| -v)
-            };
+            let mut scout = search_child(
+                position,
+                child_depth - reduction as u32,
+                alpha,
+                alpha + 1,
+                ply + 1,
+                child_static_eval_history,
+                context,
+            );
             if reduced && scout.is_some_and(|score| score > alpha) {
-                scout = negamax(
+                scout = search_child(
                     position,
-                    depth - 1,
-                    -alpha - 1,
-                    -alpha,
+                    child_depth,
+                    alpha,
+                    alpha + 1,
                     ply + 1,
                     child_static_eval_history,
                     context,
-                )
-                .map(|v| -v);
+                );
             } else if reduced {
                 reduced_without_research = true;
             }
             match scout {
-                Some(score) if score > alpha && score < beta => negamax(
+                Some(score) if score > alpha && score < beta => search_child(
                     position,
-                    depth - 1,
-                    -beta,
-                    -alpha,
+                    child_depth,
+                    alpha,
+                    beta,
                     ply + 1,
                     child_static_eval_history,
                     context,
-                )
-                .map(|v| -v),
+                ),
                 other => other,
             }
         };
@@ -332,7 +446,8 @@ pub(super) fn negamax(
         }
 
         if score >= beta {
-            if let Some(raw) = raw_static_eval
+            if excluded.is_none()
+                && let Some(raw) = raw_static_eval
                 && should_record_correction(in_check, Bound::Lower, score, raw, quiet)
             {
                 context.history.corrections.record(position, depth, score - raw);
@@ -347,14 +462,16 @@ pub(super) fn negamax(
                 );
             }
             context.recycle_ordering_buffer(ply, picker.into_buffer());
-            context.table.store(TtEntry {
-                key,
-                depth,
-                score: score_to_tt(score, ply),
-                bound: Bound::Lower,
-                best_move: Some(mv),
-                static_eval: raw_static_eval,
-            });
+            if excluded.is_none() {
+                context.table.store(TtEntry {
+                    key,
+                    depth,
+                    score: score_to_tt(score, ply),
+                    bound: Bound::Lower,
+                    best_move: Some(mv),
+                    static_eval: raw_static_eval,
+                });
+            }
             return Some(score);
         }
         if quiet && score <= alpha {
@@ -363,7 +480,14 @@ pub(super) fn negamax(
         alpha = alpha.max(score);
     }
     context.recycle_ordering_buffer(ply, picker.into_buffer());
+    // 段階生成で一手も出なかったnodeは、王手されていないが合法手がない。
+    if staged && yielded == 0 {
+        return Some(-MATE + ply as i32);
+    }
 
+    if excluded.is_some() {
+        return Some(alpha);
+    }
     // 枝刈り・再探索なしの縮小があっても常に保存する。ただしそのようなノードの
     // 窓内の結果は真値とずれ得るので、Exactは主張せずUpperへ丸める。
     let selective = pruned_move || reduced_move_without_research;
@@ -377,7 +501,7 @@ pub(super) fn negamax(
         key,
         depth,
         score: score_to_tt(alpha, ply),
-        bound: stored_bound(alpha, search_alpha, selective),
+        bound,
         best_move,
         static_eval: raw_static_eval,
     });
@@ -415,153 +539,6 @@ fn stored_bound(alpha: i32, search_alpha: i32, selective: bool) -> Bound {
     if selective { Bound::Upper } else { bound_after_search(alpha, search_alpha) }
 }
 
-/// IIR: TT moveが無く十分深いノードは1浅く探索する。
-const fn iir_depth(depth: u32, has_tt_move: bool) -> u32 {
-    if !has_tt_move && depth >= 4 { depth - 1 } else { depth }
-}
-
-/// Reverse futility: 静的評価がβをdepth比例のmargin以上上回る浅いノードは
-/// 探索せず評価値で打ち切る。improvingなら1 depth分marginを緩和する。
-fn should_reverse_futility_prune(
-    depth: u32,
-    pv_node: bool,
-    improving: bool,
-    static_eval: i32,
-    beta: i32,
-    margin_per_depth: i32,
-) -> bool {
-    let margin_depth = depth.saturating_sub(u32::from(improving));
-    depth <= 8 && !pv_node && static_eval - margin_per_depth * margin_depth as i32 >= beta
-}
-
-/// Futility: 静的評価がαへdepth比例のmargin分届かない浅いノードでは、
-/// 最初の手を除く静かな非王手手を刈る(適用はムーブループ側)。
-fn should_futility_prune_quiets(
-    depth: u32,
-    in_check: bool,
-    static_eval: Option<i32>,
-    alpha: i32,
-    margin_per_depth: i32,
-) -> bool {
-    depth <= 4
-        && !in_check
-        && static_eval.is_some_and(|eval| eval + margin_per_depth * depth as i32 <= alpha)
-}
-
-/// SEE枝刈り: 浅いnon-PVノードでは、交換値が`-margin * depth^2`を下回る捕獲を読まない。
-///
-/// `see`はMovePickerが取り出し時に計算済みの値で、捕獲以外は`None`。
-/// 王手中は回避手を減らせないので発火しない。
-fn should_prune_capture_by_see(
-    depth: u32,
-    pv_node: bool,
-    in_check: bool,
-    see: CaptureSee,
-    margin: i32,
-) -> bool {
-    if pv_node || in_check || depth > 6 {
-        return false;
-    }
-    let threshold = -margin * (depth * depth) as i32;
-    see.is_some_and(|exchange| exchange < threshold)
-}
-
-/// history枝刈り: 浅いnon-PVノードでは、履歴が`-margin * depth`を下回る静かな手を読まない。
-///
-/// 履歴は±`HISTORY_MAX`(16_384)へ飽和するので、閾値は「繰り返し失敗した手」だけを捉える。
-fn should_prune_by_history(
-    depth: u32,
-    pv_node: bool,
-    in_check: bool,
-    history_score: i32,
-    margin: i32,
-) -> bool {
-    !pv_node && !in_check && depth <= 4 && history_score < -margin * depth as i32
-}
-
-/// LMPの上限手数 `(3 + depth^2) / (2 - improving)`。improvingなら倍許す。
-fn late_move_prune_limit(depth: u32, improving: bool) -> usize {
-    ((3 + depth * depth) / (2 - u32::from(improving))) as usize
-}
-
-/// 静かな打ち駒のLMP上限。盤上の静かな手の上限を`divisor`で割り、最低1手は残す。
-///
-/// `divisor == 0`は「打ち駒を刈らない」を表し、上限なし(`None`)を返す。
-fn late_move_prune_drop_limit(depth: u32, improving: bool, divisor: i32) -> Option<usize> {
-    if divisor <= 0 {
-        return None;
-    }
-    Some((late_move_prune_limit(depth, improving) / divisor as usize).max(1))
-}
-
-fn should_prune_late_quiet_drop(
-    depth: u32,
-    pv_node: bool,
-    in_check: bool,
-    improving: bool,
-    eligible_drops_seen: usize,
-    divisor: i32,
-) -> bool {
-    !pv_node
-        && !in_check
-        && late_move_prune_drop_limit(depth, improving, divisor)
-            .is_some_and(|limit| eligible_drops_seen >= limit)
-}
-
-fn should_prune_late_quiet(
-    depth: u32,
-    pv_node: bool,
-    in_check: bool,
-    improving: bool,
-    eligible_quiets_seen: usize,
-    eligible: bool,
-) -> bool {
-    eligible
-        && !pv_node
-        && !in_check
-        && eligible_quiets_seen >= late_move_prune_limit(depth, improving)
-}
-
-/// 表引きした縮小量の基礎値へ実行時の補正を加える。
-///
-/// PVノードは浅く、improvingでないノードは深く縮小する。履歴スコアは
-/// ±16_384なので`/ 8_192`のclampは実質±1の補正になる。最終値は
-/// `0..=depth-2`へclampし、縮小後の子の深さが1を下回らないようにする。
-fn lmr_reduction(base: i32, pv_node: bool, improving: bool, history_score: i32, depth: u32) -> i32 {
-    let mut reduction = base;
-    if pv_node {
-        reduction -= 1;
-    }
-    if !improving {
-        reduction += 1;
-    }
-    reduction -= (history_score / 8_192).clamp(-1, 1);
-    reduction.clamp(0, depth as i32 - 2)
-}
-
-fn should_try_null_move(
-    zero_window: bool,
-    in_check: bool,
-    static_eval: i32,
-    beta: i32,
-    plies_from_null: u16,
-) -> bool {
-    zero_window
-        && !in_check
-        && beta > -MATE_TT_THRESHOLD
-        && plies_from_null > 0
-        && static_eval >= beta
-}
-
-/// null moveの動的縮小量 `R = 3 + depth/3 + min((static_eval - beta) / divisor, 3)`。
-///
-/// βを大きく上回るほど深く縮小する。前提により`static_eval >= beta`だが、
-/// 負側もclampして守る。
-fn null_move_reduction_amount(depth: u32, static_eval: i32, beta: i32, eval_divisor: i32) -> u32 {
-    let eval_term = ((static_eval - beta) / eval_divisor.max(1)).clamp(0, 3) as u32;
-    3 + depth / 3 + eval_term
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -574,32 +551,6 @@ mod tests {
 
     use super::super::test_support::test_context;
     use super::*;
-
-    #[test]
-    fn null_move_guard_requires_every_conservative_precondition() {
-        assert!(should_try_null_move(true, false, 20, 20, 1));
-        assert!(!should_try_null_move(false, false, 20, 20, 1));
-        assert!(!should_try_null_move(true, true, 20, 20, 1));
-        assert!(!should_try_null_move(true, false, 19, 20, 1));
-        assert!(!should_try_null_move(true, false, 20, 20, 0));
-        assert!(!should_try_null_move(true, false, 0, -MATE_TT_THRESHOLD, 1));
-        assert!(should_try_null_move(true, false, 0, -MATE_TT_THRESHOLD + 1, 1));
-    }
-
-    #[test]
-    fn null_move_reduction_grows_with_depth_and_eval_margin() {
-        // R = 3 + depth/3 + min((eval-beta)/200, 3)
-        assert_eq!(null_move_reduction_amount(4, 0, 0, 200), 4);
-        assert_eq!(null_move_reduction_amount(12, 0, 0, 200), 7);
-        assert_eq!(null_move_reduction_amount(12, 700, 0, 200), 10);
-        assert_eq!(null_move_reduction_amount(12, 5_000, 0, 200), 10, "eval項は3でclampされる");
-        assert_eq!(null_move_reduction_amount(6, -100, 0, 200), 5, "負のeval差は0へclampされる");
-        assert_eq!(
-            null_move_reduction_amount(6, 100, 0, 0),
-            8,
-            "divisor 0は1へ丸めて0除算を避ける"
-        );
-    }
 
     #[test]
     fn search_null_move_roundtrip_preserves_position_and_flips_evaluation() {
@@ -635,7 +586,7 @@ mod tests {
             .expect("valid null-cutoff position");
         let white_move = board::move_from_usi(&position, "9a8a").expect("legal real move");
         position.apply_move32(white_move);
-        let key = tt_key(&position, 1, 0);
+        let key = tt_key(&position, 0);
         let table = Arc::new(TranspositionTable::new(1));
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
         context.limits.max_depth = 4;
@@ -671,154 +622,13 @@ mod tests {
     }
 
     #[test]
-    fn see_pruning_skips_only_badly_losing_captures_in_shallow_non_pv_nodes() {
-        let margin = 80;
-        // 閾値は -margin * depth^2。depth 2なら-320。
-        assert!(should_prune_capture_by_see(2, false, false, Some(-321), margin));
-        assert!(!should_prune_capture_by_see(2, false, false, Some(-320), margin));
-        assert!(
-            !should_prune_capture_by_see(2, true, false, Some(-10_000), margin),
-            "PVノードでは刈らない"
-        );
-        assert!(
-            !should_prune_capture_by_see(2, false, true, Some(-10_000), margin),
-            "王手中は刈らない"
-        );
-        assert!(
-            !should_prune_capture_by_see(7, false, false, Some(-10_000), margin),
-            "depth 7では発火しない"
-        );
-        assert!(
-            !should_prune_capture_by_see(2, false, false, None, margin),
-            "SEEの無い手(捕獲以外)は対象外"
-        );
-    }
-
-    #[test]
-    fn history_pruning_requires_a_strongly_negative_history_in_a_shallow_non_pv_node() {
-        let margin = 2_000;
-        assert!(should_prune_by_history(1, false, false, -2_001, margin));
-        assert!(!should_prune_by_history(1, false, false, -2_000, margin));
-        assert!(should_prune_by_history(4, false, false, -8_001, margin));
-        assert!(!should_prune_by_history(4, false, false, -8_000, margin));
-        assert!(
-            !should_prune_by_history(5, false, false, -100_000, margin),
-            "depth 5では発火しない"
-        );
-        assert!(!should_prune_by_history(1, true, false, -100_000, margin), "PVノードでは刈らない");
-        assert!(!should_prune_by_history(1, false, true, -100_000, margin), "王手中は刈らない");
-        assert!(!should_prune_by_history(1, false, false, 0, margin), "履歴の無い手は刈らない");
-    }
-
-    #[test]
-    fn lmp_limit_grows_quadratically_and_doubles_when_improving() {
-        // (3 + d^2) / (2 - improving)
-        assert_eq!(late_move_prune_limit(1, false), 2);
-        assert_eq!(late_move_prune_limit(1, true), 4);
-        assert_eq!(late_move_prune_limit(3, false), 6);
-        assert_eq!(late_move_prune_limit(4, false), 9);
-        assert_eq!(late_move_prune_limit(4, true), 19);
-        assert_eq!(late_move_prune_limit(8, false), 33, "深いノードにも上限がかかる");
-    }
-
-    #[test]
-    fn quiet_drops_get_a_tighter_lmp_limit_than_board_quiets() {
-        // 盤上の静かな手の上限をdivisorで割り、最低1手は残す。
-        assert_eq!(late_move_prune_drop_limit(1, false, 2), Some(1));
-        assert_eq!(late_move_prune_drop_limit(4, false, 2), Some(4));
-        assert_eq!(late_move_prune_drop_limit(4, true, 2), Some(9));
-        assert_eq!(late_move_prune_drop_limit(8, false, 2), Some(16));
-        assert_eq!(late_move_prune_drop_limit(1, false, 6), Some(1), "上限は1手を下回らない");
-        assert_eq!(late_move_prune_drop_limit(4, false, 0), None, "divisor 0は打ち駒を刈らない");
-        assert!(
-            late_move_prune_drop_limit(6, false, 2).expect("有効なdivisor")
-                < late_move_prune_limit(6, false),
-            "打ち駒の上限は盤上の静かな手より厳しい"
-        );
-    }
-
-    #[test]
-    fn quiet_drop_pruning_keeps_the_pv_and_check_evasion_paths() {
-        assert!(should_prune_late_quiet_drop(4, false, false, false, 4, 2));
-        assert!(!should_prune_late_quiet_drop(4, false, false, false, 3, 2));
-        assert!(
-            !should_prune_late_quiet_drop(4, true, false, false, 99, 2),
-            "PVノードでは刈らない"
-        );
-        assert!(!should_prune_late_quiet_drop(4, false, true, false, 99, 2), "王手中は刈らない");
-        assert!(
-            !should_prune_late_quiet_drop(4, false, false, false, 99, 0),
-            "divisor 0は打ち駒枝刈りを無効化する"
-        );
-    }
-
-    #[test]
-    fn lmp_requires_a_non_pv_unchecked_eligible_late_quiet() {
-        assert!(should_prune_late_quiet(1, false, false, false, 2, true));
-        assert!(!should_prune_late_quiet(1, false, false, false, 1, true,));
-        assert!(!should_prune_late_quiet(1, true, false, false, 2, true), "PVノードでは刈らない");
-        assert!(!should_prune_late_quiet(1, false, true, false, 2, true), "王手中は刈らない");
-        assert!(!should_prune_late_quiet(1, false, false, true, 2, true), "improvingは上限が倍");
-        assert!(should_prune_late_quiet(1, false, false, true, 4, true));
-        assert!(
-            !should_prune_late_quiet(1, false, false, false, 2, false),
-            "対象外の手は数えるだけ"
-        );
-    }
-
-    #[test]
-    fn reverse_futility_covers_depth_8_and_relaxes_when_improving() {
-        let margin = 100;
-        assert!(should_reverse_futility_prune(8, false, false, 800, 0, margin));
-        assert!(!should_reverse_futility_prune(8, false, false, 799, 0, margin));
-        assert!(
-            !should_reverse_futility_prune(9, false, false, 10_000, 0, margin),
-            "depth 9では発火しない"
-        );
-        assert!(
-            !should_reverse_futility_prune(8, true, false, 10_000, 0, margin),
-            "PVノードでは発火しない"
-        );
-        assert!(
-            should_reverse_futility_prune(8, false, true, 700, 0, margin),
-            "improvingはmarginが1 depth分緩む"
-        );
-        assert!(!should_reverse_futility_prune(8, false, true, 699, 0, margin));
-    }
-
-    #[test]
-    fn futility_covers_depth_4_with_a_depth_scaled_margin() {
-        let margin = 100;
-        assert!(should_futility_prune_quiets(4, false, Some(-400), 0, margin));
-        assert!(!should_futility_prune_quiets(4, false, Some(-399), 0, margin));
-        assert!(
-            !should_futility_prune_quiets(5, false, Some(-10_000), 0, margin),
-            "depth 5では発火しない"
-        );
-        assert!(
-            !should_futility_prune_quiets(4, true, Some(-400), 0, margin),
-            "王手中は発火しない"
-        );
-        assert!(!should_futility_prune_quiets(4, false, None, 0, margin));
-        assert!(should_futility_prune_quiets(1, false, Some(-100), 0, margin));
-    }
-
-    #[test]
-    fn iir_reduces_only_deep_nodes_without_a_tt_move() {
-        assert_eq!(iir_depth(4, false), 3);
-        assert_eq!(iir_depth(4, true), 4);
-        assert_eq!(iir_depth(3, false), 3, "depth 3以下はそのまま");
-        assert_eq!(iir_depth(12, false), 11);
-    }
-
-    #[test]
     fn selective_lmp_result_is_not_stored_as_an_exact_tt_entry() {
         let mut position = board::hirate_position();
         for usi in ["7g7f", "3c3d"] {
             let mv = board::move_from_usi(&position, usi).expect("legal setup move");
             position.apply_move32(mv);
         }
-        let key = tt_key(&position, 1, 0);
+        let key = tt_key(&position, 0);
         let table = Arc::new(TranspositionTable::new(1));
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
         context.limits.max_depth = 2;
@@ -847,7 +657,7 @@ mod tests {
         let table = Arc::new(TranspositionTable::new(1));
         // depthが浅くbound cutは起きないが、static_evalだけ残っているentry。
         table.store(TtEntry {
-            key: tt_key(&position, 1, 0),
+            key: tt_key(&position, 0),
             depth: 0,
             score: score_to_tt(0, 1),
             bound: Bound::Upper,
@@ -861,25 +671,6 @@ mod tests {
         // material評価なら平手は0でreverse futilityは発火しない。
         // 10_000が返るのはTTのstatic_evalを使った証拠。
         assert_eq!(negamax(&mut position, 2, 0, 1, 1, [None; 2], &mut context), Some(10_000));
-    }
-
-    #[test]
-    fn lmr_adjustments_shift_the_base_by_at_most_one_each() {
-        // PVノードは-1、improvingでないと+1、履歴は±1。
-        assert_eq!(lmr_reduction(2, false, true, 0, 8), 2);
-        assert_eq!(lmr_reduction(2, true, true, 0, 8), 1);
-        assert_eq!(lmr_reduction(2, false, false, 0, 8), 3);
-        assert_eq!(lmr_reduction(2, false, true, 8_192, 8), 1);
-        assert_eq!(lmr_reduction(2, false, true, -8_192, 8), 3);
-        assert_eq!(lmr_reduction(2, false, true, 16_384, 8), 1, "履歴の補正は±1でclampされる");
-        assert_eq!(lmr_reduction(2, false, true, -16_384, 8), 3, "履歴の補正は±1でclampされる");
-    }
-
-    #[test]
-    fn lmr_reduction_clamps_into_the_valid_depth_window() {
-        assert_eq!(lmr_reduction(0, true, true, 8_192, 8), 0, "負の補正でも0未満にはならない");
-        assert_eq!(lmr_reduction(10, false, false, -16_384, 6), 4, "depth-2でclampされる");
-        assert_eq!(lmr_reduction(3, false, false, 0, 2), 0, "depth 2では縮小しない");
     }
 
     #[test]

@@ -1,10 +1,8 @@
 //! 静止探索と、その候補生成・SEEに基づく判定を担う。
 
-use rsshogi::board::{
-    CapturePlusProAll, Move32List, Position, generate_legal_all_move32, generate_moves_move32,
-};
+use rsshogi::board::{CapturePlusPro, Legal, Move32List, Position, generate_moves_move32};
 use rsshogi::mate::solve_mate_in_one;
-use rsshogi::types::Move32Metadata;
+use rsshogi::types::{Move32, Move32Metadata};
 
 use crate::eval::{EvalParams, Evaluator};
 use crate::position::MAX_SEARCH_PLY;
@@ -12,10 +10,8 @@ use crate::tt::{Bound, TtEntry};
 
 use super::context::{SearchContext, tt_key};
 use super::history::CONTINUATION_PLIES;
-use super::ordering::{MovePicker, OrderedMove};
-use super::score::{
-    bound_after_search, declaration_score, score_from_tt, score_to_tt, terminal_score,
-};
+use super::ordering::{MovePicker, OrderedMove, OrderingInputs, is_legal_generated};
+use super::score::{bound_after_search, declaration_score, score_to_tt, terminal_score, tt_cutoff};
 use super::{CaptureSee, MATE, MAX_QPLY, legal_moves};
 
 pub(super) fn qsearch(
@@ -34,39 +30,27 @@ pub(super) fn qsearch(
         return Some(score);
     }
     if ply >= MAX_SEARCH_PLY {
-        return Some(structural_leaf_score(position, ply, &context.evaluator));
+        return Some(structural_leaf_score(position, ply, &mut context.evaluator));
     }
-    let key = if qply == 0 { tt_key(position, ply, context.limits.max_moves_to_draw) } else { 0 };
+    // TTを読み書きするのは静止探索の入口だけ。再帰した先の局面は保存しない。
+    let tt = QsearchTt {
+        key: (qply == 0).then(|| tt_key(position, context.limits.max_moves_to_draw)),
+        ply,
+    };
     // 深いentryほど信頼できるので、depthによるprobeの制限は設けない。
     // 保存側はdepth 0のままなので、主探索のentryを上書きすることはない。
-    let tt_entry = (qply == 0).then(|| context.table.probe(key)).flatten();
+    let tt_entry = tt.key.and_then(|key| context.table.probe(key));
     let tt_move = tt_entry.and_then(|entry| entry.best_move);
-    if let Some(entry) = tt_entry {
-        let score = score_from_tt(entry.score, ply);
-        match entry.bound {
-            Bound::Exact => return Some(score),
-            Bound::Lower if score >= beta => return Some(score),
-            Bound::Upper if score <= alpha => return Some(score),
-            Bound::Lower => alpha = alpha.max(score),
-            Bound::Upper => {}
-        }
+    if let Some(entry) = tt_entry
+        && let Some(score) = tt_cutoff(&entry, ply, &mut alpha, beta)
+    {
+        return Some(score);
     }
     let search_alpha = alpha;
     let in_check = position.is_in_check();
     if !in_check && let Some(mate_move) = solve_mate_in_one(position) {
         let score = MATE - ply as i32 - 1;
-        store_qsearch_entry(
-            context,
-            qply,
-            TtEntry {
-                key,
-                depth: 0,
-                score: score_to_tt(score, ply),
-                bound: Bound::Exact,
-                best_move: Some(mate_move),
-                static_eval: None,
-            },
-        );
+        tt.store(context, score, Bound::Exact, Some(mate_move), None);
         return Some(score);
     }
     // 王手されていなければ、静止探索が見るのは捕獲と歩の成りだけなので、
@@ -74,113 +58,61 @@ pub(super) fn qsearch(
     // 生成はheapを使わないstack上のリストへ行う。
     let mut move_list = Move32List::new();
     if in_check {
-        generate_legal_all_move32(position, &mut move_list);
+        generate_moves_move32::<Legal>(position, &mut move_list);
     } else {
         qsearch_candidates(position, &mut move_list);
     }
     let moves = move_list.as_slice();
     if moves.is_empty() && (in_check || position.is_mated()) {
         let score = -MATE + ply as i32;
-        store_qsearch_entry(
-            context,
-            qply,
-            TtEntry {
-                key,
-                depth: 0,
-                score: score_to_tt(score, ply),
-                bound: Bound::Exact,
-                best_move: None,
-                static_eval: None,
-            },
-        );
+        tt.store(context, score, Bound::Exact, None, None);
         return Some(score);
     }
-    let stand_pat = if !in_check {
+    // TTへ書き戻すのは生の値、stand patとdelta刈りに使うのは補正後の値。
+    let (raw_stand_pat, stand_pat) = if in_check {
+        (None, None)
+    } else {
         // TT entryに静的評価が残っていれば、高価な再評価を省いてそれを使う。
         let raw = tt_entry
             .and_then(|entry| entry.static_eval)
             .unwrap_or_else(|| context.evaluator.evaluate(position));
-        // 主探索と同じ補正をstand patへも足す。TTへ保存するのは生の値。
-        let stand_pat = raw
-            + context.history.corrections.correction(position, context.params.correction_apply_max);
+        let stand_pat = context.corrected_eval(position, raw);
         if stand_pat >= beta {
-            store_qsearch_entry(
-                context,
-                qply,
-                TtEntry {
-                    key,
-                    depth: 0,
-                    score: score_to_tt(stand_pat, ply),
-                    bound: Bound::Lower,
-                    best_move: None,
-                    static_eval: Some(raw),
-                },
-            );
+            tt.store(context, stand_pat, Bound::Lower, None, Some(raw));
             return Some(stand_pat);
         }
         alpha = alpha.max(stand_pat);
-        Some((raw, stand_pat))
-    } else {
-        None
+        (Some(raw), Some(stand_pat))
     };
-    // TTへ書き戻すのは生の値、delta刈りに使うのは補正後の値。
-    let raw_stand_pat = stand_pat.map(|(raw, _)| raw);
-    let stand_pat = stand_pat.map(|(_, corrected)| corrected);
-    if qply >= MAX_QPLY && !in_check {
-        store_qsearch_entry(
-            context,
-            qply,
-            TtEntry {
-                key,
-                depth: 0,
-                score: score_to_tt(alpha, ply),
-                bound: bound_after_search(alpha, search_alpha),
-                best_move: None,
-                static_eval: raw_stand_pat,
-            },
-        );
+    if (qply >= MAX_QPLY && !in_check) || moves.is_empty() {
+        tt.store(context, alpha, bound_after_search(alpha, search_alpha), None, raw_stand_pat);
         return Some(alpha);
     }
-
-    if moves.is_empty() {
-        let score = alpha;
-        store_qsearch_entry(
-            context,
-            qply,
-            TtEntry {
-                key,
-                depth: 0,
-                score: score_to_tt(score, ply),
-                bound: bound_after_search(score, search_alpha),
-                best_move: None,
-                static_eval: raw_stand_pat,
-            },
-        );
-        return Some(score);
-    }
     let ordering_buffer = context.take_ordering_buffer(ply);
-    let mut picker = MovePicker::new(
-        position,
-        moves,
-        context.evaluator.params(),
-        tt_move,
-        [None; 2],
-        &context.history,
+    let inputs = OrderingInputs {
+        eval_params: context.evaluator.params(),
+        search_params: context.params,
+        killers: [None; 2],
         // qsearchは静かな手を並べないのでcontinuationは引かない。
-        &[None; CONTINUATION_PLIES],
-        context.params,
-        ordering_buffer,
-    );
+        previous: [None; CONTINUATION_PLIES],
+    };
+    let mut picker =
+        MovePicker::new(position, moves, tt_move, inputs, &context.history, ordering_buffer);
 
     let mut best_move = None;
     let mut pruned_move = false;
-    while let Some(ordered) = picker.next(position) {
+    while let Some(ordered) = picker.next(position, &context.history) {
         let OrderedMove { mv, metadata, see, .. } = ordered;
         // 王手判定は並べ替えでは払わず、枝刈り判定の直前で遅延計算する。
         // 王手回避中はSEE刈りが除外され、delta刈りもstand_patが無く成立しない
         // ため、判定自体を省略できる。
         let gives_check = !in_check && position.gives_check_move32(mv);
-        if should_prune_qsearch_capture_by_see(metadata, in_check || gives_check, see) {
+        if should_prune_qsearch_capture_by_see(
+            metadata,
+            in_check || gives_check,
+            see,
+            context.params.qsearch_see_margin,
+        ) {
             pruned_move = true;
             continue;
         }
@@ -201,18 +133,7 @@ pub(super) fn qsearch(
 
         if score >= beta {
             context.recycle_ordering_buffer(ply, picker.into_buffer());
-            store_qsearch_entry(
-                context,
-                qply,
-                TtEntry {
-                    key,
-                    depth: 0,
-                    score: score_to_tt(score, ply),
-                    bound: Bound::Lower,
-                    best_move: Some(mv),
-                    static_eval: raw_stand_pat,
-                },
-            );
+            tt.store(context, score, Bound::Lower, Some(mv), raw_stand_pat);
             return Some(score);
         }
         if score > alpha {
@@ -222,24 +143,47 @@ pub(super) fn qsearch(
     }
     context.recycle_ordering_buffer(ply, picker.into_buffer());
 
+    // 枝刈りした静止探索がcutoffしなかった値は、読まなかった手の分だけ真値とずれ得る。
     if !pruned_move {
-        store_qsearch_entry(
-            context,
-            qply,
-            TtEntry {
-                key,
-                depth: 0,
-                score: score_to_tt(alpha, ply),
-                bound: bound_after_search(alpha, search_alpha),
-                best_move,
-                static_eval: raw_stand_pat,
-            },
-        );
+        let bound = bound_after_search(alpha, search_alpha);
+        tt.store(context, alpha, bound, best_move, raw_stand_pat);
     }
     Some(alpha)
 }
 
-pub(super) fn structural_leaf_score(position: &Position, ply: u32, evaluator: &Evaluator) -> i32 {
+/// 静止探索の入口で使うTTの保存先。`key`が無いnodeは保存しない。
+struct QsearchTt {
+    key: Option<u64>,
+    ply: u32,
+}
+
+impl QsearchTt {
+    fn store(
+        &self,
+        context: &SearchContext,
+        score: i32,
+        bound: Bound,
+        best_move: Option<Move32>,
+        static_eval: Option<i32>,
+    ) {
+        if let Some(key) = self.key {
+            context.table.store(TtEntry {
+                key,
+                depth: 0,
+                score: score_to_tt(score, self.ply),
+                bound,
+                best_move,
+                static_eval,
+            });
+        }
+    }
+}
+
+pub(super) fn structural_leaf_score(
+    position: &Position,
+    ply: u32,
+    evaluator: &mut Evaluator,
+) -> i32 {
     if legal_moves(position).is_empty() { -MATE + ply as i32 } else { evaluator.evaluate(position) }
 }
 
@@ -250,22 +194,16 @@ fn immediate_material_gain(metadata: Move32Metadata, params: EvalParams) -> i32 
         + if metadata.is_promotion() { params.promotion_bonus } else { 0 }
 }
 
-fn store_qsearch_entry(context: &SearchContext, qply: u32, entry: TtEntry) {
-    if qply == 0 {
-        context.table.store(entry);
-    }
-}
-
 /// 静止探索で読む手を、静かな手を生成せずに直接作る。
 ///
-/// `CapturePlusProAll`は捕獲と歩の成りを返す。生成結果はpseudo-legalなので、
-/// 合法性はここで確かめる。捕獲でも歩の成りでもない成り（銀成りなど）は
-/// この時点で候補から落ちる。
+/// `CapturePlusPro`は捕獲と歩の成りを返す。生成結果はpseudo-legalなので、
+/// 自玉の安全だけをここで確かめる。捕獲でも歩の成りでもない成り（銀成りなど）は
+/// この時点で候補から落ちる。王手されていない局面でだけ使う。
 fn qsearch_candidates(position: &Position, out: &mut Move32List) {
     let mut list = Move32List::new();
-    generate_moves_move32::<CapturePlusProAll>(position, &mut list);
+    generate_moves_move32::<CapturePlusPro>(position, &mut list);
     for mv in list.as_slice().iter().copied() {
-        if position.is_legal_move32(mv) {
+        if is_legal_generated(position, mv) {
             out.push(mv);
         }
     }
@@ -275,11 +213,12 @@ fn should_prune_qsearch_capture_by_see(
     metadata: Move32Metadata,
     tactical_exclusion: bool,
     see: CaptureSee,
+    margin: i32,
 ) -> bool {
     if tactical_exclusion || !metadata.is_capture() {
         return false;
     }
-    see.is_some_and(|score| score < 0)
+    see.is_some_and(|score| score < -margin)
 }
 
 #[cfg(test)]
@@ -293,8 +232,62 @@ mod tests {
     use crate::tt::TranspositionTable;
 
     use super::super::INF;
+    use super::super::score::score_from_tt;
     use super::super::test_support::test_context;
     use super::*;
+
+    #[test]
+    fn corrected_evaluations_stay_outside_the_mate_band() {
+        use crate::nnue::MAX_NNUE_EVAL;
+
+        use super::super::negamax::negamax;
+        use super::super::score::mate_distance;
+
+        for sign in [-1, 1] {
+            for apply_max in [67, 256] {
+                let mut position = board::position_from_sfen("k8/9/9/9/9/9/9/9/8K b - 1")
+                    .expect("quiet position without a mate or declaration");
+                let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
+                context.params.correction_apply_max = apply_max;
+                for _ in 0..200 {
+                    context.history.corrections.record(&position, 16, sign * 200);
+                }
+                assert!(sign * context.history.corrections.correction(&position, apply_max) > 0);
+                let raw = sign * MAX_NNUE_EVAL;
+                let key = tt_key(&position, 0);
+                // A loose upper bound supplies a boundary static eval without an
+                // external model or a TT cutoff hiding the correction path.
+                let seed = TtEntry {
+                    key,
+                    depth: 0,
+                    score: INF,
+                    bound: Bound::Upper,
+                    best_move: None,
+                    static_eval: Some(raw),
+                };
+                context.table.store(seed);
+                let beta = if sign > 0 { 0 } else { INF };
+                let score = qsearch(&mut position, -INF, beta, 1, 0, &mut context)
+                    .expect("qsearch completes");
+                assert_eq!(score, raw);
+                assert_eq!(mate_distance(score), None);
+                let stored = context.table.probe(key).expect("qsearch stores its bound");
+                assert_eq!(stored.bound, if sign > 0 { Bound::Lower } else { Bound::Exact });
+                assert_eq!(stored.static_eval, Some(raw));
+                assert_eq!(stored.score, raw);
+                assert_eq!(score_from_tt(stored.score, 5), raw);
+
+                context.table.clear();
+                context.table.store(seed);
+                // Reverse futility returns the corrected static evaluation directly.
+                let beta = raw - 200;
+                let score = negamax(&mut position, 1, beta - 1, beta, 1, [None; 2], &mut context)
+                    .expect("main search completes");
+                assert_eq!(score, raw);
+                assert_eq!(mate_distance(score), None);
+            }
+        }
+    }
 
     #[test]
     fn qsearch_see_pruning_skips_only_completed_losing_exchanges() {
@@ -307,11 +300,13 @@ mod tests {
             position.move32_metadata(losing),
             false,
             static_exchange_eval(&position, losing, EvalParams::default()),
+            0,
         ));
         assert!(!should_prune_qsearch_capture_by_see(
             position.move32_metadata(profitable),
             false,
             static_exchange_eval(&position, profitable, EvalParams::default()),
+            0,
         ));
         let promotion_position = board::position_from_sfen("k8/9/4P4/9/9/9/9/9/8K b - 1")
             .expect("valid quiet-promotion position");
@@ -321,6 +316,7 @@ mod tests {
             promotion_position.move32_metadata(quiet_promotion),
             false,
             None,
+            0,
         ));
     }
 
@@ -336,6 +332,7 @@ mod tests {
             position.move32_metadata(losing_check),
             true,
             static_exchange_eval(&position, losing_check, EvalParams::default()),
+            0,
         ));
     }
 
@@ -408,7 +405,7 @@ mod tests {
         let mut position = board::hirate_position();
         let table = Arc::new(TranspositionTable::new(1));
         table.store(TtEntry {
-            key: tt_key(&position, 0, 0),
+            key: tt_key(&position, 0),
             depth: 0,
             score: score_to_tt(123, 0),
             bound: Bound::Exact,
@@ -432,7 +429,7 @@ mod tests {
         let mut position = board::hirate_position();
         let table = Arc::new(TranspositionTable::new(1));
         let main_entry = TtEntry {
-            key: tt_key(&position, 0, 0),
+            key: tt_key(&position, 0),
             depth: 1,
             score: score_to_tt(123, 0),
             bound: Bound::Exact,
@@ -462,7 +459,7 @@ mod tests {
         let table = Arc::new(TranspositionTable::new(1));
         // boundは使えない(Upperかつscoreが窓の下)が、static_evalだけ残っているentry。
         table.store(TtEntry {
-            key: tt_key(&position, 0, 0),
+            key: tt_key(&position, 0),
             depth: 0,
             score: score_to_tt(-5_000, 0),
             bound: Bound::Upper,
@@ -480,7 +477,7 @@ mod tests {
     fn selective_qsearch_result_is_not_stored_in_tt() {
         let mut position = board::position_from_sfen("k8/9/4p4/4s2p1/4R2P1/9/9/9/8K b - 1")
             .expect("valid selective qsearch position");
-        let key = tt_key(&position, 0, 0);
+        let key = tt_key(&position, 0);
         let table = Arc::new(TranspositionTable::new(1));
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
         context.table = Arc::clone(&table);
@@ -493,7 +490,7 @@ mod tests {
     fn qsearch_stores_an_exact_quiet_position() {
         board::init();
         let mut position = board::hirate_position();
-        let key = tt_key(&position, 0, 0);
+        let key = tt_key(&position, 0);
         let table = Arc::new(TranspositionTable::new(1));
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
         context.table = Arc::clone(&table);
@@ -559,7 +556,7 @@ mod tests {
             let mut candidates = list.as_slice().to_vec();
             candidates.sort_by_key(|mv| mv.to_usi());
 
-            let mut expected = legal_moves(&position)
+            let mut expected = super::super::search_moves(&position)
                 .into_iter()
                 .filter(|mv| {
                     let metadata = position.move32_metadata(*mv);

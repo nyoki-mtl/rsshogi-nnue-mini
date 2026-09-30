@@ -3,8 +3,7 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use rsshogi::board::Position;
-use rsshogi::types::{EnteringKingRule, MOVE_WIN};
+use rsshogi::types::MOVE_WIN;
 use rsshogi_usi::{BestMove, InfoCommand, MateScore, UsiCommand, format_command};
 
 use crate::search::{self, SearchIteration, SearchResult};
@@ -51,22 +50,6 @@ pub(super) fn write_bestmove<W: Write>(writer: &mut W, result: &SearchResult) ->
         None => BestMove::resign(),
     };
     write_command(writer, &UsiCommand::bestmove(bestmove))
-}
-
-pub(super) fn position_with_rule(mut position: Position, rule: EnteringKingRule) -> Position {
-    position.set_entering_king_rule(rule);
-    position
-}
-
-pub(super) fn parse_entering_king_rule(value: &str) -> Option<EnteringKingRule> {
-    match value {
-        "NoEnteringKing" => Some(EnteringKingRule::None),
-        "CSARule24" => Some(EnteringKingRule::Point24),
-        "CSARule24H" => Some(EnteringKingRule::Point24Handicap),
-        "CSARule27" => Some(EnteringKingRule::Point27),
-        "CSARule27H" => Some(EnteringKingRule::Point27Handicap),
-        _ => None,
-    }
 }
 
 pub(super) fn write_command<W: Write>(writer: &mut W, command: &UsiCommand) -> io::Result<()> {

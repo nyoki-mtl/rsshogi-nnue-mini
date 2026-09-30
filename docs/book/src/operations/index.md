@@ -1,9 +1,10 @@
 # 運用
 
-エンジン本体はUSI executableまでを担当する。
-CSA sessionとclockは`rsshogi-csa`、local match、SPSA、SPRT、dashboardはShogiArenaの責務である。
+エンジン本体はUSI実行ファイルまでを担当する。
+CSA接続と対局時計は`rsshogi-csa`、ローカル対局、SPSA、SPRT、ダッシュボードはShogiArenaが担当する。
 
-まず固定nodeのsmoke testでprotocolと合法手を確認し、次にSPSAで候補を生成する。
-採用判断は、学習に使っていないholdout openingと独立run directoryを使うSPRTで行う。
+- **探索設定を調整する場合**は、[ShogiArenaの手順](shogiarena.md)に従い、少数局の通信確認、SPSA、未使用の開始局面によるSPRTの順に進む。候補の採否はSPRTの条件と結果で判断する。
+- **外部CSAサーバで対局する場合**は、[CSA接続の手順](csa.md)に従い、loopback対局、実サーバでの1局、ログ確認の順に進む。
 
-外部CSAサーバへ接続する前には、`rsshogi-csa`のlocal loopbackで通常対局とponder対局を確認する。
+これまでの比較条件と結果は[開発時の測定結果](../verification.md)にまとめた。
+通信が通ること、対局が完走すること、探索が速いこと、棋力が上がることは、それぞれ別に確認する。

@@ -2,7 +2,9 @@
 //!
 //! `r = floor(ln(depth) * ln(index) * 100 / divisor)` をworkerの探索開始時に
 //! 事前計算し、探索loopでは表引きだけを行う。PVノード・improving・履歴による
-//! 補正は`negamax`側で実行時に加える。
+//! 補正は[`lmr_reduction`]が実行時に加える。
+
+use crate::params::SearchParams;
 
 /// depth/move indexの表の一辺。どちらもこの値-1へ飽和する。
 const TABLE_SIZE: usize = 64;
@@ -35,6 +37,31 @@ impl LmrReductions {
         let index = index.min(TABLE_SIZE - 1);
         self.table[depth][index] as i32
     }
+}
+
+/// 表引きした縮小量の基礎値へ実行時の補正を加える。
+///
+/// PVノードは浅く、improvingでないノードは深く縮小する。履歴スコアによる
+/// 補正は`lmr_history_divisor`で段数へ換算し、`±lmr_history_clamp`に収める。
+/// 最終値は`0..=depth-2`へclampし、縮小後の子の深さが1を下回らないようにする。
+pub(super) fn lmr_reduction(
+    base: i32,
+    pv_node: bool,
+    improving: bool,
+    history_score: i32,
+    depth: u32,
+    params: &SearchParams,
+) -> i32 {
+    let mut reduction = base;
+    if pv_node {
+        reduction -= 1;
+    }
+    if !improving {
+        reduction += 1;
+    }
+    let clamp = params.lmr_history_clamp.max(0);
+    reduction -= (history_score / params.lmr_history_divisor.max(1)).clamp(-clamp, clamp);
+    reduction.clamp(0, depth as i32 - 2)
 }
 
 #[cfg(test)]
@@ -88,5 +115,46 @@ mod tests {
             }
         }
         assert!(aggressive.base(16, 16) > conservative.base(16, 16));
+    }
+
+    #[test]
+    fn lmr_adjustments_shift_the_base_by_at_most_one_each() {
+        let lmr = SearchParams {
+            lmr_history_divisor: 8_192,
+            lmr_history_clamp: 1,
+            ..SearchParams::default()
+        };
+        // PVノードは-1、improvingでないと+1、履歴は±1。
+        assert_eq!(lmr_reduction(2, false, true, 0, 8, &lmr), 2);
+        assert_eq!(lmr_reduction(2, true, true, 0, 8, &lmr), 1);
+        assert_eq!(lmr_reduction(2, false, false, 0, 8, &lmr), 3);
+        assert_eq!(lmr_reduction(2, false, true, 8_192, 8, &lmr), 1);
+        assert_eq!(lmr_reduction(2, false, true, -8_192, 8, &lmr), 3);
+        assert_eq!(
+            lmr_reduction(2, false, true, 16_384, 8, &lmr),
+            1,
+            "履歴の補正は±1でclampされる"
+        );
+        assert_eq!(
+            lmr_reduction(2, false, true, -16_384, 8, &lmr),
+            3,
+            "履歴の補正は±1でclampされる"
+        );
+    }
+
+    #[test]
+    fn lmr_reduction_clamps_into_the_valid_depth_window() {
+        let lmr = SearchParams {
+            lmr_history_divisor: 8_192,
+            lmr_history_clamp: 1,
+            ..SearchParams::default()
+        };
+        assert_eq!(
+            lmr_reduction(0, true, true, 8_192, 8, &lmr),
+            0,
+            "負の補正でも0未満にはならない"
+        );
+        assert_eq!(lmr_reduction(10, false, false, -16_384, 6, &lmr), 4, "depth-2でclampされる");
+        assert_eq!(lmr_reduction(3, false, false, 0, 2, &lmr), 0, "depth 2では縮小しない");
     }
 }

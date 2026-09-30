@@ -6,11 +6,13 @@ mod history;
 mod lmr;
 mod negamax;
 mod ordering;
+mod pruning;
 mod qsearch;
 mod root;
 mod score;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod timing;
 
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,13 +26,14 @@ use rsshogi::types::{MOVE_WIN, Move32};
 use crate::eval::Evaluator;
 use crate::nnue::MAX_NNUE_EVAL;
 use crate::params::SearchParams;
-use crate::position::{MAX_SEARCH_DEPTH, MAX_SEARCH_PLY, validate_evaluable_position};
+use crate::position::{MAX_SEARCH_DEPTH, validate_evaluable_position};
 use crate::tt::TranspositionTable;
 
-use context::SearchContext;
+use context::{SearchContext, SharedSearch};
 pub(crate) use history::HistoryTables;
-use root::{collect_pv, fallback_root_choice, release_reserved_node, search_root};
+use root::{collect_pv, fallback_root_choice, search_root};
 use score::root_terminal_score;
+use timing::IterationTiming;
 
 pub use deadline::SearchDeadline;
 pub(crate) use score::mate_distance;
@@ -47,22 +50,15 @@ fn aspiration_window(center: i32, delta: i32) -> (i32, i32) {
     (center.saturating_sub(delta).max(-INF), center.saturating_add(delta).min(INF))
 }
 
-/// 失敗した側だけを広げた次の窓と、次の拡大幅。
+/// 窓を外した側だけを、外れた値から`delta`離れた位置まで広げる。
 ///
-/// 反対側の境界はそのまま残す。窓の片側を保つほど、次の探索は狭い窓の
-/// 速さを保てる。
-fn widened_aspiration_window(
-    score: i32,
-    delta: i32,
-    failed_low: bool,
-    alpha: i32,
-    beta: i32,
-) -> (i32, i32, i32) {
-    let widened = delta.saturating_add(delta / 2);
-    if failed_low {
-        (score.saturating_sub(widened).max(-INF), beta, widened)
+/// 反対側は動かさない。外れた値の近くに真の値があることが多いので、
+/// 全窓へ飛ぶより狭い窓で読み直した方が安い。
+fn widen_aspiration_window(alpha: i32, beta: i32, score: i32, delta: i32) -> (i32, i32) {
+    if score <= alpha {
+        (score.saturating_sub(delta).max(-INF), beta)
     } else {
-        (alpha, score.saturating_add(widened).min(INF), widened)
+        (alpha, score.saturating_add(delta).min(INF))
     }
 }
 
@@ -167,21 +163,29 @@ impl SearchControl {
     }
 }
 
+/// 一回の`go`で探索する内容。常駐coordinatorから[`run`]へ渡す。
+pub struct SearchJob {
+    pub position: Position,
+    pub evaluator: Evaluator,
+    pub params: SearchParams,
+    pub limits: SearchLimits,
+    pub control: SearchControl,
+    pub events: Sender<SearchEvent>,
+    pub threads: usize,
+}
+
+/// 結果を公開するメインworkerだけが持つ役割。
+struct MainWorker<'a> {
+    events: &'a Sender<SearchEvent>,
+    /// 深さ1を完了したら立て、ヘルパーの探索を始めさせる。
+    helpers_start: &'a AtomicBool,
+}
+
 /// `histories`はworker slotごとの履歴テーブルで、呼び出し側が`go`をまたいで保持する。
 /// worker数と長さが合わなければ作り直し、探索開始時に全slotを半減(aging)する。
 /// panicで終わった探索は履歴を返さず、次の`go`がゼロから作り直す。
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    position: Position,
-    evaluator: Evaluator,
-    params: SearchParams,
-    mut limits: SearchLimits,
-    control: SearchControl,
-    events: Sender<SearchEvent>,
-    table: Arc<TranspositionTable>,
-    histories: &mut Vec<HistoryTables>,
-    threads: usize,
-) {
+pub fn run(job: SearchJob, table: Arc<TranspositionTable>, histories: &mut Vec<HistoryTables>) {
+    let SearchJob { position, evaluator, params, mut limits, control, events, threads } = job;
     let start = Instant::now();
     if validate_evaluable_position(&position).is_err() {
         let _ = events.send(SearchEvent::Done(SearchResult::fail_closed(start.elapsed())));
@@ -190,14 +194,6 @@ pub fn run(
     limits.max_depth = limits.max_depth.clamp(1, MAX_SEARCH_DEPTH);
     limits.max_nodes = limits.max_nodes.map(|nodes| nodes.max(1));
     table.new_search();
-    #[cfg(test)]
-    let panic_after_helpers_spawned = control.panic_after_helpers_spawned;
-    #[cfg(test)]
-    let fail_helper_spawn_at = control.fail_helper_spawn_at;
-    #[cfg(test)]
-    let panic_helper_worker = control.panic_helper_worker;
-    let cancel = control.cancel;
-    let pondering = control.pondering;
     // 履歴は`go`をまたいで持続する。worker数が変わったら作り直し、
     // 新しい探索の開始時に全slotを半減して古い傾向の重みを下げる。
     let worker_count = threads.max(1);
@@ -206,46 +202,40 @@ pub fn run(
     }
     for history in histories.iter_mut() {
         history.age();
+        history.configure(&params);
     }
     let mut history_slots = std::mem::take(histories);
     let helper_histories = history_slots.drain(1..).collect::<Vec<_>>();
     let main_history = history_slots.pop().expect("worker 0 always has a history slot");
-    // Reserve the first node for the reporting worker's evaluated root fallback.
-    let shared_nodes = Arc::new(AtomicU64::new(1));
+    let shared = SharedSearch {
+        cancel: control.cancel,
+        pondering: control.pondering,
+        // Reserve the first node for the reporting worker's evaluated root fallback.
+        nodes: Arc::new(AtomicU64::new(1)),
+        table,
+    };
     let helpers_start = Arc::new(AtomicBool::new(false));
     let mut helpers = Vec::new();
     for (worker_id, helper_history) in (1..worker_count).zip(helper_histories) {
         let helper_position = position.clone();
-        let helper_evaluator = evaluator.clone();
-        let helper_limits = limits.clone();
-        let helper_cancel = Arc::clone(&cancel);
-        let helper_pondering = Arc::clone(&pondering);
-        let helper_table = Arc::clone(&table);
-        let helper_nodes = Arc::clone(&shared_nodes);
+        let helper_context = SearchContext::new(
+            evaluator.clone(),
+            params,
+            limits.clone(),
+            shared.clone(),
+            helper_history,
+        );
         let helper_start = Arc::clone(&helpers_start);
+        #[cfg(test)]
+        let panic_helper_worker = control.panic_helper_worker;
         let helper_work = move || {
-            wait_for_helper_start(&helper_start, &helper_cancel);
+            wait_for_helper_start(&helper_start, &helper_context.cancel);
             #[cfg(test)]
             assert_ne!(panic_helper_worker, Some(worker_id), "injected helper search panic");
-            let (_, helper_history) = search_worker(
-                helper_position,
-                helper_evaluator,
-                params,
-                helper_limits,
-                helper_cancel,
-                helper_pondering,
-                None,
-                helper_table,
-                helper_nodes,
-                helper_history,
-                worker_id,
-                false,
-                None,
-            );
-            helper_history
+            search_worker(helper_position, helper_context, worker_id, None).1
         };
         #[cfg(test)]
-        let spawn_result = if fail_helper_spawn_at == Some(worker_id) {
+        let spawn_result = if control.fail_helper_spawn_at == Some(worker_id) {
             Err(std::io::Error::other("injected helper spawn failure"))
         } else {
             thread::Builder::new().spawn(helper_work)
@@ -255,7 +245,7 @@ pub fn run(
         match spawn_result {
             Ok(helper) => helpers.push(helper),
             Err(error) => {
-                cancel.store(true, Ordering::Relaxed);
+                shared.cancel.store(true, Ordering::Relaxed);
                 for helper in helpers {
                     let _ = helper.join();
                 }
@@ -264,26 +254,14 @@ pub fn run(
         }
     }
 
+    let main_context = SearchContext::new(evaluator, params, limits, shared.clone(), main_history);
     let result = catch_unwind(AssertUnwindSafe(|| {
         #[cfg(test)]
-        assert!(!panic_after_helpers_spawned, "injected main search worker panic");
-        search_worker(
-            position,
-            evaluator,
-            params,
-            limits,
-            Arc::clone(&cancel),
-            pondering,
-            Some(&events),
-            table,
-            Arc::clone(&shared_nodes),
-            main_history,
-            0,
-            true,
-            Some(&helpers_start),
-        )
+        assert!(!control.panic_after_helpers_spawned, "injected main search worker panic");
+        let main = MainWorker { events: &events, helpers_start: &helpers_start };
+        search_worker(position, main_context, 0, Some(main))
     }));
-    cancel.store(true, Ordering::Relaxed);
+    shared.cancel.store(true, Ordering::Relaxed);
     let mut helper_panic = None;
     let mut returned_helper_histories = Vec::with_capacity(worker_count.saturating_sub(1));
     for helper in helpers {
@@ -302,7 +280,7 @@ pub fn run(
         Ok((mut result, main_history)) => {
             histories.push(main_history);
             histories.append(&mut returned_helper_histories);
-            result.nodes = shared_nodes.load(Ordering::Relaxed);
+            result.nodes = shared.nodes.load(Ordering::Relaxed);
             let _ = events.send(SearchEvent::Done(result));
         }
     }
@@ -314,99 +292,54 @@ fn wait_for_helper_start(start: &AtomicBool, cancel: &AtomicBool) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// 一つのworkerの反復深化。`main`はメインworkerだけが持つ。
+///
+/// メインworkerは予約した1 nodeでrootの子を評価してfallbackを用意し、
+/// iterationごとに`Info`を送り、softな締切で新しいiterationを止める。
 fn search_worker(
     mut position: Position,
-    mut evaluator: Evaluator,
-    params: SearchParams,
-    limits: SearchLimits,
-    cancel: Arc<AtomicBool>,
-    pondering: Arc<AtomicBool>,
-    events: Option<&Sender<SearchEvent>>,
-    table: Arc<TranspositionTable>,
-    shared_nodes: Arc<AtomicU64>,
-    history: HistoryTables,
+    mut context: SearchContext,
     worker_id: usize,
-    reserved_fallback_node: bool,
-    helpers_start: Option<&AtomicBool>,
+    main: Option<MainWorker<'_>>,
 ) -> (SearchResult, HistoryTables) {
     let start = Instant::now();
-    let root_terminal = root_terminal_score(&position, limits.max_moves_to_draw);
+    let root_terminal = root_terminal_score(&position, context.limits.max_moves_to_draw);
     let declaration_move = position.declaration_win_move();
-    if root_terminal.is_none() && declaration_move == MOVE_WIN {
-        release_reserved_node(&shared_nodes, reserved_fallback_node);
-        return (
-            SearchResult {
-                best_move: Some(declaration_move),
-                ponder_move: None,
-                score: MATE,
-                depth: 0,
-                nodes: shared_nodes.load(Ordering::Relaxed),
-                elapsed: start.elapsed(),
-                pv: Vec::new(),
-            },
-            history,
-        );
-    }
     let mut root_moves = legal_moves(&position);
     let has_legal_move = !root_moves.is_empty();
-    if !limits.searchmoves.is_empty() {
-        root_moves.retain(|mv| limits.searchmoves.iter().any(|text| text == &mv.to_usi()));
+    if !context.limits.searchmoves.is_empty() {
+        root_moves.retain(|mv| context.limits.searchmoves.iter().any(|text| text == &mv.to_usi()));
     }
 
-    if root_moves.is_empty() {
-        release_reserved_node(&shared_nodes, reserved_fallback_node);
-        return (
-            SearchResult {
-                best_move: None,
-                ponder_move: None,
-                score: root_terminal.unwrap_or(if has_legal_move { 0 } else { -MATE }),
-                depth: 0,
-                nodes: shared_nodes.load(Ordering::Relaxed),
-                elapsed: start.elapsed(),
-                pv: Vec::new(),
-            },
-            history,
-        );
-    }
-
-    if let Some(score) = root_terminal {
-        release_reserved_node(&shared_nodes, reserved_fallback_node);
-        return (
-            SearchResult {
-                best_move: Some(root_moves[0]),
-                ponder_move: None,
-                score,
-                depth: 0,
-                nodes: shared_nodes.load(Ordering::Relaxed),
-                elapsed: start.elapsed(),
-                pv: vec![root_moves[0]],
-            },
-            history,
-        );
+    // 探索せずに決まる結果。予約したnodeは使わないので返す。
+    let immediate = if root_terminal.is_none() && declaration_move == MOVE_WIN {
+        Some((Some(declaration_move), MATE, Vec::new()))
+    } else if root_moves.is_empty() {
+        let score = root_terminal.unwrap_or(if has_legal_move { 0 } else { -MATE });
+        Some((None, score, Vec::new()))
+    } else {
+        root_terminal.map(|score| (Some(root_moves[0]), score, vec![root_moves[0]]))
+    };
+    if let Some((best_move, score, pv)) = immediate {
+        if main.is_some() {
+            context.nodes.fetch_sub(1, Ordering::Relaxed);
+        }
+        let result = SearchResult {
+            best_move,
+            ponder_move: None,
+            score,
+            depth: 0,
+            nodes: context.node_count(),
+            elapsed: start.elapsed(),
+            pv,
+        };
+        return (result, context.history);
     }
 
     let rotation = worker_id % root_moves.len();
     root_moves.rotate_left(rotation);
-    evaluator.initialize(&position);
-    let killer_count = limits.max_depth as usize + MAX_QPLY as usize + 4;
-    let mut context = SearchContext {
-        evaluator,
-        params,
-        limits,
-        cancel,
-        pondering,
-        nodes: shared_nodes,
-        table,
-        history,
-        killers: vec![[None; 2]; killer_count],
-        lmr: lmr::LmrReductions::new(params.lmr_divisor),
-        ordering: std::iter::repeat_with(Default::default)
-            .take(MAX_SEARCH_PLY as usize + 2)
-            .collect(),
-        continuation: vec![None; MAX_SEARCH_PLY as usize + 2],
-    };
-    let (fallback_move, fallback_score) = if reserved_fallback_node {
+    context.evaluator.initialize(&position);
+    let (fallback_move, fallback_score) = if main.is_some() {
         fallback_root_choice(&mut position, &root_moves, &mut context)
     } else {
         (root_moves[0], 0)
@@ -414,26 +347,27 @@ fn search_worker(
     let mut completed_depth = 0;
     let mut best_move = fallback_move;
     let mut best_score = fallback_score;
+    let mut timing = IterationTiming::new(&context.params);
+    let mut time_scale = 1.0;
 
     for depth in 1..=context.limits.max_depth.max(1) {
         if context.should_stop() {
             break;
         }
+        context.root_depth = depth;
         // 残り予算で次のiterationが終わらない見込みなら、丸ごと捨てる探索を始めない。
         // 判断するのは結果を公開するworkerだけで、helperは最後までTTを埋める。
-        if depth > 1 && events.is_some() && context.should_skip_new_iteration() {
+        if depth > 1 && main.is_some() && context.should_skip_new_iteration(time_scale) {
             break;
         }
         if let Some(index) = root_moves.iter().position(|mv| *mv == best_move) {
             root_moves.swap(0, index);
         }
 
-        // aspiration: 失敗した側だけを段階的に広げ、同じdepthを引き直す。
-        // 全窓へ一気に落とすと、外した1回の費用が大きすぎる。
-        let mut delta = context.params.aspiration_window;
+        // 完了した探索がaspiration窓を外れたら、外れた側だけを広げて同じdepthを引き直す。
+        let mut delta = context.params.aspiration_window.max(1);
         let (mut window_alpha, mut window_beta) =
             if depth >= 2 { aspiration_window(best_score, delta) } else { (-INF, INF) };
-        let mut widenings = 0;
         let outcome = loop {
             let Some(outcome) = search_root(
                 &mut position,
@@ -453,22 +387,10 @@ fn search_worker(
             if !failed_low && !failed_high {
                 break Some(outcome);
             }
-            widenings += 1;
-            if widenings > context.params.aspiration_widenings
-                || mate_distance(outcome.score).is_some()
-                || delta >= INF / 2
-            {
-                window_alpha = -INF;
-                window_beta = INF;
-            } else {
-                (window_alpha, window_beta, delta) = widened_aspiration_window(
-                    outcome.score,
-                    delta,
-                    failed_low,
-                    window_alpha,
-                    window_beta,
-                );
-            }
+            // 外すたびに幅を倍にするので、何度外しても数回で全窓に届く。
+            delta = delta.saturating_mul(2);
+            (window_alpha, window_beta) =
+                widen_aspiration_window(window_alpha, window_beta, outcome.score, delta);
         };
         let Some(outcome) = outcome else {
             break;
@@ -482,13 +404,12 @@ fn search_worker(
             break;
         }
         completed_depth = depth;
-        if depth == 1
-            && let Some(start) = helpers_start
-        {
-            start.store(true, Ordering::Release);
-        }
-        if let Some(events) = events {
-            let _ = events.send(SearchEvent::Info(SearchIteration {
+        time_scale = timing.record(best_move, best_score, root_moves.len());
+        if let Some(main) = &main {
+            if depth == 1 {
+                main.helpers_start.store(true, Ordering::Release);
+            }
+            let _ = main.events.send(SearchEvent::Info(SearchIteration {
                 depth,
                 score: best_score,
                 nodes: context.node_count(),
@@ -517,15 +438,19 @@ fn legal_moves(position: &Position) -> Vec<Move32> {
     list.as_slice().to_vec()
 }
 
+/// 主探索と静止探索が扱う手（歩・角・飛の不成を除く合法手）。testの比較に使う。
+#[cfg(test)]
+fn search_moves(position: &Position) -> Vec<Move32> {
+    let mut list = Move32List::new();
+    rsshogi::board::generate_moves_move32::<rsshogi::board::Legal>(position, &mut list);
+    list.as_slice().to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-
     use rsshogi::board;
 
-    use crate::eval::EvalParams;
-
-    use super::test_support::run_result;
+    use super::test_support::{depth_limits, idle_control, material_job, run_result};
     use super::*;
 
     #[test]
@@ -536,32 +461,24 @@ mod tests {
     }
 
     #[test]
-    fn widening_moves_only_the_failed_bound_and_grows_the_delta_by_half() {
-        // fail-low: alphaだけを下げ、betaはそのまま。
-        assert_eq!(widened_aspiration_window(90, 20, true, 100, 140), (60, 140, 30));
-        // fail-high: betaだけを上げ、alphaはそのまま。
-        assert_eq!(widened_aspiration_window(150, 20, false, 100, 140), (100, 180, 30));
-        // 拡大幅は1.5倍ずつ増える。
-        let (_, _, delta) = widened_aspiration_window(0, 30, true, -30, 30);
-        assert_eq!(delta, 45);
-        // 境界はINFを越えない。
-        assert_eq!(widened_aspiration_window(-INF, 20, true, -INF + 1, 0).0, -INF);
-        assert_eq!(widened_aspiration_window(INF, 20, false, 0, INF - 1).1, INF);
+    fn a_failed_aspiration_widens_only_the_failing_side() {
+        assert_eq!(
+            widen_aspiration_window(95, 145, 95, 50),
+            (45, 145),
+            "fail-lowはalphaだけ下げる"
+        );
+        assert_eq!(
+            widen_aspiration_window(95, 145, 200, 50),
+            (95, 250),
+            "fail-highはbetaだけ上げる"
+        );
+        assert_eq!(widen_aspiration_window(-INF + 10, 0, -INF + 10, 100), (-INF, 0));
+        assert_eq!(widen_aspiration_window(0, INF - 10, INF - 10, 100), (0, INF));
     }
 
     #[test]
     fn the_reported_pv_is_a_legal_line_that_starts_with_the_best_move() {
-        let result = run_result(
-            board::hirate_position(),
-            SearchLimits {
-                max_depth: 5,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            1,
-        );
+        let result = run_result(board::hirate_position(), depth_limits(5), 1);
 
         let best_move = result.best_move.expect("hirate has legal moves");
         assert_eq!(result.pv.first().copied(), Some(best_move));
@@ -579,26 +496,15 @@ mod tests {
     fn helper_spawn_failure_cancels_and_joins_already_started_helpers() {
         let cancel = Arc::new(AtomicBool::new(false));
         let retained_cancel = Arc::clone(&cancel);
-        let (sender, receiver) = mpsc::channel();
+        let (job, receiver) = material_job(
+            board::hirate_position(),
+            depth_limits(MAX_SEARCH_DEPTH),
+            SearchControl::new(cancel, Arc::new(AtomicBool::new(false)))
+                .with_failed_helper_spawn(2),
+            4,
+        );
         let result = catch_unwind(AssertUnwindSafe(|| {
-            run(
-                board::hirate_position(),
-                Evaluator::material(EvalParams::default()),
-                SearchParams::default(),
-                SearchLimits {
-                    max_depth: MAX_SEARCH_DEPTH,
-                    max_nodes: None,
-                    deadline: None,
-                    searchmoves: Vec::new(),
-                    max_moves_to_draw: 0,
-                },
-                SearchControl::new(cancel, Arc::new(AtomicBool::new(false)))
-                    .with_failed_helper_spawn(2),
-                sender,
-                Arc::new(TranspositionTable::new(1)),
-                &mut Vec::new(),
-                4,
-            );
+            run(job, Arc::new(TranspositionTable::new(1)), &mut Vec::new());
         }));
 
         assert!(result.is_err(), "spawn failure must propagate to the coordinator boundary");
@@ -611,26 +517,14 @@ mod tests {
     fn helper_panic_is_joined_and_propagated_without_a_done_event() {
         let cancel = Arc::new(AtomicBool::new(false));
         let retained_cancel = Arc::clone(&cancel);
-        let (sender, receiver) = mpsc::channel();
+        let (job, receiver) = material_job(
+            board::hirate_position(),
+            depth_limits(2),
+            SearchControl::new(cancel, Arc::new(AtomicBool::new(false))).with_panicking_helper(1),
+            2,
+        );
         let result = catch_unwind(AssertUnwindSafe(|| {
-            run(
-                board::hirate_position(),
-                Evaluator::material(EvalParams::default()),
-                SearchParams::default(),
-                SearchLimits {
-                    max_depth: 2,
-                    max_nodes: None,
-                    deadline: None,
-                    searchmoves: Vec::new(),
-                    max_moves_to_draw: 0,
-                },
-                SearchControl::new(cancel, Arc::new(AtomicBool::new(false)))
-                    .with_panicking_helper(1),
-                sender,
-                Arc::new(TranspositionTable::new(1)),
-                &mut Vec::new(),
-                2,
-            );
+            run(job, Arc::new(TranspositionTable::new(1)), &mut Vec::new());
         }));
 
         assert!(result.is_err(), "helper panic must propagate to the coordinator boundary");
@@ -644,17 +538,7 @@ mod tests {
         board::init();
         let position = board::hirate_position();
         let original = position.clone();
-        let result = run_result(
-            position,
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            1,
-        );
+        let result = run_result(position, depth_limits(1), 1);
 
         assert_eq!(result.depth, 1);
         assert!(original.is_legal_move32(result.best_move.expect("best move")));
@@ -668,17 +552,8 @@ mod tests {
         )
         .expect("valid position");
         let original = position.clone();
-        let result = run_result(
-            position,
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 100,
-            },
-            1,
-        );
+        let result =
+            run_result(position, SearchLimits { max_moves_to_draw: 100, ..depth_limits(1) }, 1);
 
         assert!(result.best_move.is_some_and(|mv| original.is_legal_move32(mv)));
         assert_eq!(result.score, 0);
@@ -694,17 +569,8 @@ mod tests {
         assert_eq!(position.declaration_win_move(), MOVE_WIN);
         let original = position.clone();
 
-        let result = run_result(
-            position,
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 100,
-            },
-            1,
-        );
+        let result =
+            run_result(position, SearchLimits { max_moves_to_draw: 100, ..depth_limits(1) }, 1);
 
         assert_eq!(result.depth, 0);
         assert_eq!(result.score, 0);
@@ -716,13 +582,7 @@ mod tests {
     fn searchmoves_restricts_root() {
         let result = run_result(
             board::hirate_position(),
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: vec!["7g7f".to_owned()],
-                max_moves_to_draw: 0,
-            },
+            SearchLimits { searchmoves: vec!["7g7f".to_owned()], ..depth_limits(1) },
             1,
         );
 
@@ -733,17 +593,8 @@ mod tests {
     fn node_limited_fallback_pairs_the_move_with_its_static_score() {
         let position = board::position_from_sfen("4k4/9/9/9/4r4/4P4/9/9/4K4 b - 1")
             .expect("valid fallback position");
-        let result = run_result(
-            position,
-            SearchLimits {
-                max_depth: 64,
-                max_nodes: Some(1),
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            1,
-        );
+        let result =
+            run_result(position, SearchLimits { max_nodes: Some(1), ..depth_limits(64) }, 1);
 
         assert_eq!(result.depth, 0);
         assert_eq!(result.best_move.expect("fallback move").to_usi(), "5f5e");
@@ -755,24 +606,13 @@ mod tests {
     fn cancelled_search_bounds_root_fallback_to_the_reserved_node() {
         let position = board::position_from_sfen("4k4/9/9/9/4r4/4P4/9/9/4K4 b - 1")
             .expect("valid fallback position");
-        let (sender, receiver) = mpsc::channel();
-        run(
+        let (job, receiver) = material_job(
             position,
-            Evaluator::material(EvalParams::default()),
-            SearchParams::default(),
-            SearchLimits {
-                max_depth: MAX_SEARCH_DEPTH,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
+            depth_limits(MAX_SEARCH_DEPTH),
             SearchControl::new(Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false))),
-            sender,
-            Arc::new(TranspositionTable::new(1)),
-            &mut Vec::new(),
             1,
         );
+        run(job, Arc::new(TranspositionTable::new(1)), &mut Vec::new());
         let result = receiver
             .into_iter()
             .find_map(|event| match event {
@@ -791,13 +631,7 @@ mod tests {
     fn multi_thread_search_respects_the_shared_node_limit() {
         let result = run_result(
             board::hirate_position(),
-            SearchLimits {
-                max_depth: MAX_SEARCH_DEPTH,
-                max_nodes: Some(5),
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
+            SearchLimits { max_nodes: Some(5), ..depth_limits(MAX_SEARCH_DEPTH) },
             4,
         );
 
@@ -808,13 +642,7 @@ mod tests {
     fn helper_workers_do_not_preempt_the_main_workers_first_iteration() {
         let result = run_result(
             board::hirate_position(),
-            SearchLimits {
-                max_depth: MAX_SEARCH_DEPTH,
-                max_nodes: Some(100),
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
+            SearchLimits { max_nodes: Some(100), ..depth_limits(MAX_SEARCH_DEPTH) },
             4,
         );
 
@@ -826,13 +654,7 @@ mod tests {
     fn direct_search_limits_depth_before_allocating_search_state() {
         let result = run_result(
             board::hirate_position(),
-            SearchLimits {
-                max_depth: u32::MAX,
-                max_nodes: Some(1),
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
+            SearchLimits { max_nodes: Some(1), ..depth_limits(u32::MAX) },
             1,
         );
 
@@ -846,17 +668,7 @@ mod tests {
             "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 65535",
         )
         .expect("syntactically valid high-ply position");
-        let result = run_result(
-            position,
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            1,
-        );
+        let result = run_result(position, depth_limits(1), 1);
 
         assert_eq!(result.best_move, None);
         assert_eq!(result.nodes, 0);
@@ -866,17 +678,7 @@ mod tests {
     fn capturable_opposing_king_fails_closed_without_applying_a_move() {
         let position = board::position_from_sfen("4k4/4R4/9/9/9/9/9/9/4K4 b - 1")
             .expect("syntactically valid invalid position");
-        let result = run_result(
-            position,
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            1,
-        );
+        let result = run_result(position, depth_limits(1), 1);
 
         assert_eq!(result.best_move, None);
         assert_eq!(result.nodes, 0);
@@ -885,24 +687,9 @@ mod tests {
     /// 深さ1では静かな手のβカットが起きないため、履歴は探索自体からは変化しない。
     /// これを使って、runをまたぐ持続とagingだけを観測する。
     fn run_depth_one(histories: &mut Vec<HistoryTables>, threads: usize) {
-        let (sender, receiver) = mpsc::channel();
-        run(
-            board::hirate_position(),
-            Evaluator::material(EvalParams::default()),
-            SearchParams::default(),
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            SearchControl::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))),
-            sender,
-            Arc::new(TranspositionTable::new(1)),
-            histories,
-            threads,
-        );
+        let (job, receiver) =
+            material_job(board::hirate_position(), depth_limits(1), idle_control(), threads);
+        run(job, Arc::new(TranspositionTable::new(1)), histories);
         assert!(
             receiver.into_iter().any(|event| matches!(event, SearchEvent::Done(_))),
             "search should finish"
@@ -967,17 +754,7 @@ mod tests {
     fn depth_two_returns_a_legal_ponder_move() {
         board::init();
         let position = board::hirate_position();
-        let result = run_result(
-            position.clone(),
-            SearchLimits {
-                max_depth: 2,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            1,
-        );
+        let result = run_result(position.clone(), depth_limits(2), 1);
 
         let best_move = result.best_move.expect("best move");
         let mut child = position;

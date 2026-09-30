@@ -21,10 +21,14 @@ use input::{InputEvent, spawn_stdin_reader};
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_HASH_MB: usize = 16;
+const MAX_HASH_MB: usize = 1_024;
 const DEFAULT_THREADS: usize = 1;
 const MAX_THREADS: usize = 16;
 const DEFAULT_ENTERING_KING_RULE: EnteringKingRule = EnteringKingRule::Point27;
-const DEFAULT_EVAL_FILE: &str = "eval/nn.bin";
+#[cfg(feature = "embedded-rsnn")]
+const DEFAULT_EVAL_FILE: &str = "@default";
+#[cfg(not(feature = "embedded-rsnn"))]
+const DEFAULT_EVAL_FILE: &str = "eval/model.rsnn";
 
 pub fn run() -> io::Result<()> {
     board::init();

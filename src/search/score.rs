@@ -3,9 +3,26 @@
 use rsshogi::board::Position;
 use rsshogi::types::{MOVE_WIN, RepetitionState};
 
-use crate::tt::Bound;
+use crate::tt::{Bound, TtEntry};
 
 use super::{MATE, MATE_TT_THRESHOLD, REPETITION_SUPERIOR};
+
+/// TT entryのboundで窓の外と分かれば、その値を返す。
+///
+/// 打ち切れない下限は`alpha`を引き上げる。どのentryを使ってよいかは呼び出し側が判断する。
+pub(super) fn tt_cutoff(entry: &TtEntry, ply: u32, alpha: &mut i32, beta: i32) -> Option<i32> {
+    let score = score_from_tt(entry.score, ply);
+    match entry.bound {
+        Bound::Exact => Some(score),
+        Bound::Lower if score >= beta => Some(score),
+        Bound::Upper if score <= *alpha => Some(score),
+        Bound::Lower => {
+            *alpha = (*alpha).max(score);
+            None
+        }
+        Bound::Upper => None,
+    }
+}
 
 /// 探索でalphaを更新できたかどうかで、TTへ格納するboundを決める。
 pub(super) fn bound_after_search(alpha: i32, search_alpha: i32) -> Bound {
@@ -82,8 +99,7 @@ mod tests {
 
     use crate::nnue::MAX_NNUE_EVAL;
 
-    use super::super::SearchLimits;
-    use super::super::test_support::run_result;
+    use super::super::test_support::{depth_limits, run_result};
     use super::*;
 
     #[test]
@@ -117,17 +133,7 @@ mod tests {
         assert_eq!(terminal_score(&position, 0, 0), Some(-REPETITION_SUPERIOR));
         assert_eq!(root_terminal_score(&position, 0), None);
 
-        let result = run_result(
-            position.clone_for_search(),
-            SearchLimits {
-                max_depth: 1,
-                max_nodes: None,
-                deadline: None,
-                searchmoves: Vec::new(),
-                max_moves_to_draw: 0,
-            },
-            1,
-        );
+        let result = run_result(position.clone_for_search(), depth_limits(1), 1);
         assert_eq!(result.depth, 1);
         assert!(result.nodes > 0);
         assert!(result.best_move.is_some_and(|mv| position.is_legal_move32(mv)));

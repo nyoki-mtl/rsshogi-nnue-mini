@@ -2,11 +2,11 @@ name: "rsshogi-nnue-mini baseline"
 engine_path: "dist/rsshogi-nnue-mini-tuning-avx2.exe"
 working_directory: "dist"
 options:
-  FV_SCALE: 24
-  SearchAspirationWindow: 80
-  SearchReverseFutilityMargin: 140
-  SearchFutilityMargin: 180
-  SearchNullMoveEvalDivisor: 200
-  SearchLmrDivisor: 236
-  SearchQsearchDeltaMargin: 120
-  SearchCheckBonus: 4000
+  FV_SCALE: 21
+  SearchAspirationWindow: 83
+  SearchReverseFutilityMargin: 144
+  SearchFutilityMargin: 172
+  SearchNullMoveEvalDivisor: 199
+  SearchLmrDivisor: 225
+  SearchQsearchDeltaMargin: 119
+  SearchCheckBonus: 4200

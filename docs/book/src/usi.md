@@ -1,56 +1,88 @@
 # USI
 
-## 対応command
+**USI**は、GUIと将棋エンジンが標準入出力を通じてコマンドと応答をやり取りするプロトコルである。
+初回起動の例は[動かしてみる](getting-started.md)を参照。
 
-- `usi` / `isready` / `setoption`
-- `usinewgame` / `position`
-- `go` / `stop` / `ponderhit`
-- `gameover` / `quit`
-- `go mate`は`checkmate notimplemented`
+## 対応コマンド
 
-`USI_Ponder`をadvertiseし、通常探索の`bestmove`には探索済みで合法性を再確認したponder候補を付ける。
-`go ponder`を受けた場合は`ponderhit`または`stop`まで`bestmove`を抑止する。
-`ponderhit`は探索を停止せず、ponder状態の解除と時間予算の起点の引き直しを行う。
-ShogiHomeが送る時刻引数付きの`ponderhit`も同じ扱いである。
-node制限はponder中も数える。
-time制限はponder中の到達判定を保留し、`ponderhit`の時点から予算を計り直す。
-`go ponder`は相手の手番に走らせる探索なので、`go ponder`の時刻で締切を固定すると、相手が長考しただけで自分の思考時間を失う。
-`go infinite`も`stop`まで`bestmove`を返さない。
-`bestmove`の直前には、最終的に返すdepth、score、nodes、PVを同じ`info`として再送する。
-詰み評価は通常評価値へ混ぜず、符号付きの`score mate N`で出力する。
-rootですでに勝敗が決まっている場合は距離0に符号を保持できないため、勝ちは`score mate +`、負けは`score mate -`で出力する。
+| コマンド | 本エンジンの動作 |
+| --- | --- |
+| `usi` | エンジン情報、オプション一覧、`usiok`を返す |
+| `isready` | 評価ファイルを読み込み、成功時に`readyok`を返す |
+| `setoption` | オプションを設定する |
+| `usinewgame` | 進行中の探索結果を破棄し、置換表と探索履歴を初期化する |
+| `position` | 初期局面またはSFENから指し手を再生する |
+| `go` | 現在の局面で探索を開始する |
+| `stop` | 探索を止め、最終結果を一度だけ返す |
+| `ponderhit` | 先読みの結果を利用する探索へ移る |
+| `gameover` | 進行中の探索を止め、結果を破棄する |
+| `quit` | 探索を止め、ワーカーの終了を待って終了する |
+| `go mate` | `checkmate notimplemented`を返す |
 
-USIのscoreは手番側視点である。
-ShogiArenaが出力するKIFの`**評価値=`も指し手側視点であり、KIF欄は整数だけを保持するため、USIで`score mate N`だった値もKIF上では319xxの内部値になる。
-mate/cpの種別を確認するときはUSI transcriptを参照する。
+`go depth`の指定値は1〜64に収める。
+時間やノード数の指定がなく、`infinite`でも`ponder`でもない`go`は、深さ4を上限とする。
+`go nodes 0`は、返す手と評価値を確保するため1ノードとして扱う。
+`searchmoves`を指定するとルートの候補手を制限できる。
+`position`で受理するSFENは、物理的な駒数と探索用の手数の範囲に収まり、相手玉を取れる合法手を含まない局面に限る。
+手数は65407以下とし、探索用に128 plyを確保する。
 
-## runtime option
+## 先読みと停止
 
-- `USI_Hash`：共有TTのMiB数。既定は16、範囲は1から1024
-- `Threads`：mainを含む探索worker数。既定は1、範囲は1から16
-- `MoveOverhead`：GUIや中継との往復のために、各`go`の予算から引くms数。既定は500、範囲は0から5000
-- `USI_Ponder`：GUIまたはbridgeがponder経路を使うかを示すcheck
-- `EnteringKingRule`：CSA 24点法、27点法とその駒落ち版を選べる入玉宣言勝ちの規則で、既定はCSA 27点法
-- `MaxMovesToDraw`：探索中にこの手数を超えた局面を引き分けとする。`0`で無効、範囲は0から65407
+`USI_Ponder`は、GUIや中継が先読みを利用するかどうかを示すオプションである。
+探索モードそのものは`go ponder`で決まる。
+`go ponder`では、`ponderhit`または`stop`を受け取るまで`bestmove`を返さない。
+深さやノード数の上限で先に探索を終えた場合は、結果を保留する。
 
-`EnteringKingRule`と`MaxMovesToDraw`のoption名と値は、やねうら王に合わせている。
+ponder中は時間切れによる停止を保留し、`ponderhit`を受けた時点から、`go`で決めた時間予算を計り直す。
+進行中の探索を止める必要はない。
+ShogiHomeが送る時刻引数付きの`ponderhit`も同じ扱いで、引数から時間予算を再計算するわけではない。
+`go infinite`の結果も、`stop`を受け取るまで保留する。
 
-通常ビルドはstandard NNUE、`eval/nn.bin`、`FV_SCALE=24`を固定する。
-tuning binaryは評価値parameter 8個、探索parameter 12個、`UseNNUE`、`EvalFile`、`FV_SCALE`、`Clear Hash`を追加で広告する。
-`Clear Hash`はSPSAのvariant間で置換表を初期化するために使う。
+`bestmove`の直前には、返す手に対応する深さ、評価値、ノード数、読み筋を最終`info`として出力する。
+読み筋の2手目が合法と確認できた場合は、`bestmove`にponder候補を付ける。
+詰み評価は`score mate N`、通常評価は`score cp N`で出力する。
+ルートで勝敗が決まっている場合は、距離0の符号を表すため、勝ちは`score mate +`、負けは`score mate -`とする。
 
-`go depth`は64以下に制限する。
-`position`は、探索できる手数と物理的な駒数の範囲に収まるSFENを受理する。
-`go nodes 0`は、着手と評価値が対応する必須fallbackを作るため1 nodeとして扱う。
-時間予算は残り時間、増秒、秒読みから求め、`MoveOverhead`を安全余裕として差し引く。
-反復深化は通常、予算の60%を過ぎた時点で新しいiterationの開始を止める。
-`movetime`と純秒読みでは予算の全体を使う。
-予算と締切の設計は[時間管理](search/time.md)で追う。
+評価値は手番側の視点である。
+棋譜や対局ツールへ転記した値は、そのツールの保存形式に依存する。
+詰みと通常評価の種別を確認するときは、USIの通信記録を参照する。
 
-`USI_Hash`とruntime規則の変更は進行中の探索をcancelし、stale resultを公開せずに適用する。
-`usinewgame`もTTを消去する。
+## 実行時オプション
 
-## tunable manifest
+| 名前 | 既定値 | 設定範囲と意味 |
+| --- | --- | --- |
+| `USI_Hash` | 16 | 共有置換表のサイズ。1〜1024 MiB |
+| `Threads` | 1 | メインを含む探索ワーカー数。1〜16 |
+| `MoveOverhead` | 500 | 一手の時間予算から引く安全余裕。0〜5000 ms |
+| `USI_Ponder` | false | GUIや中継による先読み利用の指定 |
+| `EvalPackage` | 通常版: `eval/model.rsnn`、内蔵版: `@default` | 読み込む512幅・ThreatなしSFNNv15 `.rsnn`のパス。内蔵版の`@default`は実行ファイル内のモデル |
+| `EnteringKingRule` | `CSARule27` | 下表の入玉規則 |
+| `MaxMovesToDraw` | 0 | SFENの手数がこの値を超えた局面を引き分けとする。0で無効、最大65407 |
 
-`--features tuning`で作成したtuning binaryだけが、独自command`usi_tunables`へShogiArenaの`shogiarena.usi_tunables.v1` JSONと`usi_tunablesok`を返す。
-manifestは探索parameter 12個と`FV_SCALE`を対象にし、parameterは`go`開始時にsnapshotされる。
+| `EnteringKingRule`の値 | 意味 |
+| --- | --- |
+| `NoEnteringKing` | 入玉宣言勝ちを使わない |
+| `CSARule24` / `CSARule27` | 24点法 / 27点法 |
+| `CSARule24H` / `CSARule27H` | それぞれの駒落ち用規則 |
+
+通常ビルドと調整用ビルドは、ともに`.rsnn`と既定の`eval/model.rsnn`を使う。
+通常ビルドは`FV_SCALE=21`に固定する。
+調整用ビルド（`--features tuning`）は探索パラメータ35個、時間管理の定数5個、`FV_SCALE`、`Clear Hash`を追加でオプション一覧に出す。
+駒の価値を表す8個のパラメータは、どちらのビルドでもUSIからは変更できない。
+
+`USI_Hash`、`Threads`、入玉規則、手数上限の変更は進行中の探索を止め、古い結果を出さずに適用する。
+`MoveOverhead`は次の`go`から適用するため、設定時に進行中の探索は止めない。
+`Clear Hash`は探索を止めて、置換表と探索履歴を消去する。
+`usinewgame`も同じ初期化を行う。
+時間の配分と締切の詳細は[時間管理](search/time.md)を参照。
+
+## 調整対象の一覧を取得する
+
+調整用ビルドだけが、独自コマンド`usi_tunables`に応答する。
+応答は`info string shogiarena_tunables_json `に続く`shogiarena.usi_tunables.v1`形式のJSONと、終端の`usi_tunablesok`である。
+JSONには探索パラメータ35個、時間管理の定数5個、`FV_SCALE`の計41個について、既定値、範囲、更新スケジュールを含める。
+通常ビルドはこのコマンドに応答しない。
+
+各パラメータは`go`開始時に確定し、その探索中は同じ値を使う。
+SPSAで動かす項目は、設定ファイルの`select`で選ぶ。
+実行方法は[ShogiArenaの手順](operations/shogiarena.md)を参照。

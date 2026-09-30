@@ -4,10 +4,11 @@
 /.uv-cache/
 /eval/
 /runs/
+/work_dir/
 /csa-logs/
 /.verification/
 /docs/book/book/
 *.exe
 *.nnue
-nn.bin
+*.rsnn
 

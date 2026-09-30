@@ -1,6 +1,8 @@
 //! USI commandを解釈し、探索の開始・停止と結果の公開を司る。
 
 use std::io::{self, Write};
+use std::ops::RangeInclusive;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -11,22 +13,21 @@ use rsshogi_usi::{CheckmateResponse, GoParams, UsiCommand, UsiOption, parse_line
 
 use crate::eval::EvalParams;
 use crate::eval::Evaluator;
-use crate::nnue::{DEFAULT_FV_SCALE, StandardNetwork};
+use crate::nnue::{DEFAULT_FV_SCALE, MobileNetwork};
 use crate::params::SearchParams;
 #[cfg(feature = "tuning")]
-use crate::params::tunable_manifest;
+use crate::params::{FV_SCALE_RANGE, tunable_manifest};
 use crate::position::{MAX_ROOT_GAME_PLY, replay};
-use crate::search::{SearchDeadline, SearchEvent, SearchResult};
+use crate::search::{SearchControl, SearchDeadline, SearchEvent, SearchJob, SearchResult};
 
 #[cfg(feature = "tuning")]
 use super::output::write_raw;
-use super::output::{
-    parse_entering_king_rule, position_with_rule, write_bestmove, write_command, write_search_info,
-};
+use super::output::{write_bestmove, write_command, write_search_info};
 use super::time::{DEFAULT_MOVE_OVERHEAD_MS, MAX_MOVE_OVERHEAD_MS, limits_from_go};
-use super::worker::{SearchRequest, SearchWorkerRuntime};
+use super::worker::SearchWorkerRuntime;
 use super::{
-    DEFAULT_ENTERING_KING_RULE, DEFAULT_EVAL_FILE, DEFAULT_HASH_MB, DEFAULT_THREADS, MAX_THREADS,
+    DEFAULT_ENTERING_KING_RULE, DEFAULT_EVAL_FILE, DEFAULT_HASH_MB, DEFAULT_THREADS, MAX_HASH_MB,
+    MAX_THREADS,
 };
 
 pub(super) struct Engine {
@@ -39,7 +40,7 @@ pub(super) struct Engine {
     pub(super) entering_king_rule: EnteringKingRule,
     pub(super) max_moves_to_draw: u32,
     pub(super) move_overhead_ms: u64,
-    pub(super) network: Option<Arc<StandardNetwork>>,
+    pub(super) network: Option<Arc<MobileNetwork>>,
     pub(super) search: Option<SearchTask>,
     pub(super) worker: SearchWorkerRuntime,
     pub(super) quit: bool,
@@ -78,15 +79,13 @@ impl Engine {
             {
                 write_raw(
                     writer,
-                    &format!("info string shogiarena_tunables_json {}", tunable_manifest()),
+                    &format!(
+                        "info string shogiarena_tunables_json {}",
+                        tunable_manifest(DEFAULT_FV_SCALE)
+                    ),
                 )?;
                 write_raw(writer, "usi_tunablesok")?;
             }
-            #[cfg(not(feature = "tuning"))]
-            {
-                return Ok(());
-            }
-            #[cfg(feature = "tuning")]
             return Ok(());
         }
 
@@ -105,69 +104,9 @@ impl Engine {
             UsiCommand::Usi => {
                 write_command(writer, &UsiCommand::id_name("rsshogi-nnue-mini"))?;
                 write_command(writer, &UsiCommand::id_author("rsshogi contributors"))?;
-                #[cfg(feature = "tuning")]
-                for option in SearchParams::usi_options() {
+                for option in usi_options() {
                     write_command(writer, &UsiCommand::Option(option))?;
                 }
-                write_command(writer, &UsiCommand::Option(UsiOption::check("USI_Ponder", false)))?;
-                #[cfg(feature = "tuning")]
-                write_command(
-                    writer,
-                    &UsiCommand::Option(UsiOption::spin(
-                        "FV_SCALE",
-                        i64::from(DEFAULT_FV_SCALE),
-                        1,
-                        128,
-                    )),
-                )?;
-                // 以下2つのoption名と値はやねうら王互換。GUIや運用scriptの設定を
-                // 他engineと共通のまま使えるようにするため、独自名へは変えない。
-                write_command(
-                    writer,
-                    &UsiCommand::Option(UsiOption::combo(
-                        "EnteringKingRule",
-                        "CSARule27",
-                        ["NoEnteringKing", "CSARule24", "CSARule24H", "CSARule27", "CSARule27H"],
-                    )),
-                )?;
-                write_command(
-                    writer,
-                    &UsiCommand::Option(UsiOption::spin(
-                        "MaxMovesToDraw",
-                        0,
-                        0,
-                        i64::from(MAX_ROOT_GAME_PLY),
-                    )),
-                )?;
-                write_command(
-                    writer,
-                    &UsiCommand::Option(UsiOption::spin(
-                        "USI_Hash",
-                        DEFAULT_HASH_MB as i64,
-                        1,
-                        1_024,
-                    )),
-                )?;
-                write_command(
-                    writer,
-                    &UsiCommand::Option(UsiOption::spin(
-                        "Threads",
-                        DEFAULT_THREADS as i64,
-                        1,
-                        MAX_THREADS as i64,
-                    )),
-                )?;
-                write_command(
-                    writer,
-                    &UsiCommand::Option(UsiOption::spin(
-                        "MoveOverhead",
-                        DEFAULT_MOVE_OVERHEAD_MS as i64,
-                        0,
-                        MAX_MOVE_OVERHEAD_MS as i64,
-                    )),
-                )?;
-                #[cfg(feature = "tuning")]
-                write_command(writer, &UsiCommand::Option(UsiOption::button("Clear Hash")))?;
                 write_command(writer, &UsiCommand::usiok())?;
             }
             UsiCommand::SetOption { name, value } => {
@@ -255,9 +194,20 @@ impl Engine {
                     &UsiCommand::info_string("USI_Ponder requires true or false"),
                 )?,
             },
+            "EvalPackage" => match value.filter(|path| !path.is_empty()) {
+                Some(path) => {
+                    self.stop_search(false, writer)?;
+                    self.eval_file = path.to_owned();
+                    self.network = None;
+                    self.worker.clear();
+                }
+                None => {
+                    write_command(writer, &UsiCommand::info_string("EvalPackage requires a path"))?
+                }
+            },
             #[cfg(feature = "tuning")]
-            "FV_SCALE" => match value.and_then(|text| text.parse::<i32>().ok()) {
-                Some(scale) if (1..=128).contains(&scale) => {
+            "FV_SCALE" => match parse_in_range(value, FV_SCALE_RANGE.0..=FV_SCALE_RANGE.1) {
+                Some(scale) => {
                     self.stop_search(false, writer)?;
                     self.fv_scale = scale;
                     self.worker.clear();
@@ -267,18 +217,20 @@ impl Engine {
                     &UsiCommand::info_string("FV_SCALE must be an integer in 1..=128"),
                 )?,
             },
-            "USI_Hash" => match value.and_then(|text| text.parse::<usize>().ok()) {
-                Some(megabytes) if (1..=1_024).contains(&megabytes) => {
+            "USI_Hash" => match parse_in_range(value, 1..=MAX_HASH_MB) {
+                Some(megabytes) => {
                     self.stop_search(false, writer)?;
                     self.worker.resize_hash(megabytes);
                 }
                 _ => write_command(
                     writer,
-                    &UsiCommand::info_string("USI_Hash must be an integer in 1..=1024"),
+                    &UsiCommand::info_string(format!(
+                        "USI_Hash must be an integer in 1..={MAX_HASH_MB}"
+                    )),
                 )?,
             },
-            "Threads" => match value.and_then(|text| text.parse::<usize>().ok()) {
-                Some(threads) if (1..=MAX_THREADS).contains(&threads) => {
+            "Threads" => match parse_in_range(value, 1..=MAX_THREADS) {
+                Some(threads) => {
                     self.stop_search(false, writer)?;
                     self.threads = threads;
                 }
@@ -290,8 +242,8 @@ impl Engine {
                 )?,
             },
             // 進行中の探索の締切は`go`の時点で確定しているため、ここでcancelしない。
-            "MoveOverhead" => match value.and_then(|text| text.parse::<u64>().ok()) {
-                Some(overhead) if overhead <= MAX_MOVE_OVERHEAD_MS => {
+            "MoveOverhead" => match parse_in_range(value, 0..=MAX_MOVE_OVERHEAD_MS) {
+                Some(overhead) => {
                     self.move_overhead_ms = overhead;
                 }
                 _ => write_command(
@@ -312,8 +264,8 @@ impl Engine {
                     write_command(writer, &UsiCommand::info_string("unsupported EnteringKingRule"))?
                 }
             },
-            "MaxMovesToDraw" => match value.and_then(|text| text.parse::<u32>().ok()) {
-                Some(max_moves) if max_moves <= MAX_ROOT_GAME_PLY => {
+            "MaxMovesToDraw" => match parse_in_range(value, 0..=MAX_ROOT_GAME_PLY) {
+                Some(max_moves) => {
                     self.stop_search(false, writer)?;
                     self.max_moves_to_draw = max_moves;
                     self.worker.clear();
@@ -339,7 +291,8 @@ impl Engine {
     }
 
     fn start_search(&mut self, params: GoParams) {
-        let mut limits = limits_from_go(&self.position, &params, self.move_overhead_ms);
+        let mut limits =
+            limits_from_go(&self.position, &params, self.move_overhead_ms, &self.search_params);
         limits.max_moves_to_draw = self.max_moves_to_draw;
         let ponder = params.ponder;
         let position = self.position.clone();
@@ -351,24 +304,21 @@ impl Engine {
             }
         };
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
         let pondering = Arc::new(AtomicBool::new(params.ponder));
-        let worker_pondering = Arc::clone(&pondering);
-        let (sender, receiver) = mpsc::channel();
+        let (events, receiver) = mpsc::channel();
         let deadline = limits.deadline.clone();
+        let control = SearchControl::new(Arc::clone(&cancel), Arc::clone(&pondering));
         #[cfg(test)]
-        let panic_after_helpers_spawned = std::mem::take(&mut self.panic_next_search);
-        self.worker.start(SearchRequest {
+        let control =
+            control.with_panic_after_helpers_spawned(std::mem::take(&mut self.panic_next_search));
+        self.worker.start(SearchJob {
             position,
             evaluator,
-            search_params: self.search_params,
+            params: self.search_params,
             limits,
-            cancel: worker_cancel,
-            pondering: worker_pondering,
-            events: sender,
+            control,
+            events,
             threads: self.threads,
-            #[cfg(test)]
-            panic_after_helpers_spawned,
         });
         self.search = Some(SearchTask {
             cancel,
@@ -389,15 +339,23 @@ impl Engine {
             return Ok(true);
         }
 
-        match StandardNetwork::load(&self.eval_file) {
+        #[cfg(feature = "embedded-rsnn")]
+        let loaded = if self.eval_file == "@default" {
+            MobileNetwork::load_embedded()
+        } else {
+            MobileNetwork::load(std::path::Path::new(&self.eval_file), None)
+        };
+        #[cfg(not(feature = "embedded-rsnn"))]
+        let loaded = MobileNetwork::load(std::path::Path::new(&self.eval_file), None);
+
+        match loaded {
             Ok(network) => {
                 write_command(
                     writer,
                     &UsiCommand::info_string(format!(
-                        "loaded standard NNUE: {} ({}, {})",
+                        "loaded mobile .rsnn: {} digest={}",
                         self.eval_file,
-                        crate::nnue::SUPPORTED_ARCHITECTURE,
-                        StandardNetwork::inference_route()
+                        network.digest()
                     )),
                 )?;
                 self.network = Some(Arc::new(network));
@@ -518,6 +476,72 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// `usi`へ返すoption。この順にGUIへ表示される。
+fn usi_options() -> Vec<UsiOption> {
+    let mut options = Vec::new();
+    #[cfg(feature = "tuning")]
+    options.extend(SearchParams::usi_options());
+    options.push(UsiOption::check("USI_Ponder", false));
+    options.push(UsiOption::string("EvalPackage", DEFAULT_EVAL_FILE));
+    #[cfg(feature = "tuning")]
+    options.push(UsiOption::spin(
+        "FV_SCALE",
+        i64::from(DEFAULT_FV_SCALE),
+        i64::from(FV_SCALE_RANGE.0),
+        i64::from(FV_SCALE_RANGE.1),
+    ));
+    // 以下2つのoption名と値はやねうら王互換。GUIや運用scriptの設定を
+    // 他engineと共通のまま使えるようにするため、独自名へは変えない。
+    let default_rule = ENTERING_KING_RULES
+        .iter()
+        .find(|(_, rule)| *rule == DEFAULT_ENTERING_KING_RULE)
+        .map(|(name, _)| *name)
+        .expect("the default entering-king rule has a USI name");
+    options.push(UsiOption::combo(
+        "EnteringKingRule",
+        default_rule,
+        ENTERING_KING_RULES.map(|(name, _)| name),
+    ));
+    options.push(UsiOption::spin("MaxMovesToDraw", 0, 0, i64::from(MAX_ROOT_GAME_PLY)));
+    options.push(UsiOption::spin("USI_Hash", DEFAULT_HASH_MB as i64, 1, MAX_HASH_MB as i64));
+    options.push(UsiOption::spin("Threads", DEFAULT_THREADS as i64, 1, MAX_THREADS as i64));
+    options.push(UsiOption::spin(
+        "MoveOverhead",
+        DEFAULT_MOVE_OVERHEAD_MS as i64,
+        0,
+        MAX_MOVE_OVERHEAD_MS as i64,
+    ));
+    #[cfg(feature = "tuning")]
+    options.push(UsiOption::button("Clear Hash"));
+    options
+}
+
+/// `setoption`の値を整数として読み、範囲外なら`None`を返す。
+fn parse_in_range<T: FromStr + PartialOrd>(
+    value: Option<&str>,
+    range: RangeInclusive<T>,
+) -> Option<T> {
+    value.and_then(|text| text.parse().ok()).filter(|parsed| range.contains(parsed))
+}
+
+/// USIの入玉規則名と規則の対応。
+const ENTERING_KING_RULES: [(&str, EnteringKingRule); 5] = [
+    ("NoEnteringKing", EnteringKingRule::None),
+    ("CSARule24", EnteringKingRule::Point24),
+    ("CSARule24H", EnteringKingRule::Point24Handicap),
+    ("CSARule27", EnteringKingRule::Point27),
+    ("CSARule27H", EnteringKingRule::Point27Handicap),
+];
+
+fn parse_entering_king_rule(value: &str) -> Option<EnteringKingRule> {
+    ENTERING_KING_RULES.iter().find(|(name, _)| *name == value).map(|(_, rule)| *rule)
+}
+
+fn position_with_rule(mut position: Position, rule: EnteringKingRule) -> Position {
+    position.set_entering_king_rule(rule);
+    position
 }
 
 pub(super) struct SearchTask {

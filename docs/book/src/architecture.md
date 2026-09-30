@@ -1,7 +1,7 @@
 # 実行時の構成
 
 探索中にも、GUIから`stop`、`ponderhit`、新しい`position`が届く。
-探索threadがUSIへ直接出力すると、停止したはずの探索から古い`bestmove`が遅れて届き、次の局面の応答と混ざり得る。
+探索スレッドがUSIへ直接出力すると、停止したはずの探索から古い`bestmove`が遅れて届き、次の局面の応答と混ざり得る。
 この競合を避けるため、通信と探索を別の所有者へ分けている。
 
 <svg viewBox="0 0 760 410" xmlns="http://www.w3.org/2000/svg" style="max-width: 760px; width: 100%; height: auto; font-family: sans-serif;">
@@ -33,49 +33,51 @@
   </g>
   <g fill="currentColor" font-size="13">
     <text x="80" y="56" text-anchor="middle">GUI</text>
-    <text x="80" y="75" text-anchor="middle" font-size="11" opacity="0.75">USI command</text>
-    <text x="275" y="56" text-anchor="middle">parser / formatter</text>
+    <text x="80" y="75" text-anchor="middle" font-size="11" opacity="0.75">USIコマンド</text>
+    <text x="275" y="56" text-anchor="middle">解析・整形</text>
     <text x="275" y="75" text-anchor="middle" font-size="11" opacity="0.75">rsshogi-usi</text>
-    <text x="490" y="56" text-anchor="middle">USI session</text>
-    <text x="490" y="75" text-anchor="middle" font-size="11" opacity="0.75">stdoutとcommand順序を所有</text>
+    <text x="490" y="56" text-anchor="middle">USIセッション</text>
+    <text x="490" y="75" text-anchor="middle" font-size="11" opacity="0.75">出力とコマンド順を管理</text>
     <text x="680" y="56" text-anchor="middle">stdout</text>
     <text x="680" y="75" text-anchor="middle" font-size="11" opacity="0.75">info / bestmove</text>
-    <text x="275" y="174" text-anchor="middle">search coordinator</text>
-    <text x="275" y="193" text-anchor="middle" font-size="11" opacity="0.75">job開始、cancel、join</text>
+    <text x="275" y="174" text-anchor="middle">探索コーディネーター</text>
+    <text x="275" y="193" text-anchor="middle" font-size="11" opacity="0.75">開始、停止、終了待ち</text>
     <text x="275" y="208" text-anchor="middle" font-size="11" opacity="0.75">探索をまたいで常駐</text>
-    <text x="165" y="309" text-anchor="middle">main worker</text>
+    <text x="165" y="309" text-anchor="middle">メインワーカー</text>
     <text x="165" y="328" text-anchor="middle" font-size="11" opacity="0.75">infoと最終結果を生成</text>
-    <text x="165" y="346" text-anchor="middle" font-size="11" opacity="0.75">局面、評価器、history</text>
-    <text x="395" y="309" text-anchor="middle">helper workers</text>
+    <text x="165" y="346" text-anchor="middle" font-size="11" opacity="0.75">局面、評価器、履歴</text>
+    <text x="395" y="309" text-anchor="middle">補助ワーカー</text>
     <text x="395" y="328" text-anchor="middle" font-size="11" opacity="0.75">探索結果をTTへ蓄積</text>
-    <text x="395" y="346" text-anchor="middle" font-size="11" opacity="0.75">局面、評価器、history</text>
+    <text x="395" y="346" text-anchor="middle" font-size="11" opacity="0.75">局面、評価器、履歴</text>
     <text x="625" y="309" text-anchor="middle">共有状態</text>
-    <text x="625" y="328" text-anchor="middle" font-size="11" opacity="0.75">TT、node count</text>
-    <text x="625" y="346" text-anchor="middle" font-size="11" opacity="0.75">cancel</text>
+    <text x="625" y="328" text-anchor="middle" font-size="11" opacity="0.75">TT、ノード数</text>
+    <text x="625" y="346" text-anchor="middle" font-size="11" opacity="0.75">停止フラグ</text>
   </g>
 </svg>
 
-## sessionが出力を直列化する
+## セッションが出力を直列化する
 
-**USI session**だけがstdoutを所有し、parserから受け取ったcommandと探索結果を順番に処理する。
-探索workerは`info`や完了結果をchannelへ送り、sessionがUSIの文字列へ整形して出力する。
+**USIセッション**だけが標準出力を所有し、解析したコマンドと探索結果を順番に処理する。
+探索ワーカーは`info`や完了結果をチャネルへ送り、セッションがUSIの文字列へ整形して出力する。
 
-`position`や`usinewgame`で局面が切り替わると、sessionは進行中の探索をcancelして完了を回収する。
-探索jobには世代があるため、古いjobの結果は新しい局面へ流れない。
+`position`や`usinewgame`で局面が切り替わると、セッションは進行中の探索を停止して完了を回収する。
+終了を回収してから次の探索へ進むため、破棄した探索の`bestmove`を新しい局面の応答として出力しない。
 
-## coordinatorが探索の寿命を管理する
+## コーディネーターが探索の寿命を管理する
 
-**search coordinator**はsessionと同じ期間だけ常駐し、`go`ごとにworkerへ探索jobを渡す。
-main workerが`info`と最終結果を作り、helper workerは共有置換表を通じて探索を助ける。
-探索が終わるとhelperを停止してjoinし、全workerの終了を確定してから結果をsessionへ返す。
+**探索コーディネーター**はセッションと同じ期間だけ常駐し、`go`ごとにワーカーへ探索を渡す。
+メインワーカーが`info`と最終結果を作り、補助ワーカーは共有置換表を通じて探索を助ける。
+探索が終わると補助ワーカーを停止して終了を待ち、全ワーカーの終了を確かめてから結果をセッションへ返す。
 
-各workerは局面、NNUE accumulator、history、killerを個別に持つ。
-共有するのは置換表、node count、cancelであり、探索中に頻繁に書き換わる状態はworker内へ閉じ込める。
+各ワーカーは局面、NNUE accumulator、history、killerを個別に持つ。
+置換表、ノードカウンタ、停止フラグ、ponder状態と締切を共有し、局面や評価状態の更新は各ワーカー内で行う。
+main history、correction history、continuation historyは同じ対局の`go`をまたいで保持し、`usinewgame`で破棄する。
+killerと指し手の履歴スタックは、探索ごとに作り直す。
 
 ## 局面と評価状態を同じ手数に保つ
 
-探索workerが指し手を進めると、局面の直後にNNUE accumulatorも進める。
+探索ワーカーが指し手を進めると、局面の直後にNNUE accumulatorも進める。
 指し手を戻した直後にはaccumulatorの履歴も戻す。
 この順序により、探索木の局面と評価値が常に同じ手数を指す。
 
-workerの分担は[Lazy SMPによる並列探索](search/parallel.md)、停止とponderの時間契約は[時間管理](search/time.md)で詳しく扱う。
+ワーカーの分担は[Lazy SMPによる並列探索](search/parallel.md)、停止とponderの時間契約は[時間管理](search/time.md)で詳しく扱う。

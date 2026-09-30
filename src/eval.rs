@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rsshogi::board::Position;
 use rsshogi::types::{Color, Hand, HandPiece, Move32, PieceType};
 
-use crate::nnue::{MAX_NNUE_EVAL, StandardAccumulator, StandardNetwork};
+use crate::nnue::{AccumulatorStack, MAX_NNUE_EVAL, MobileNetwork};
 
 #[derive(Clone)]
 pub struct Evaluator {
@@ -13,9 +13,9 @@ pub struct Evaluator {
 
 #[derive(Clone)]
 struct NnueEvaluator {
-    network: Arc<StandardNetwork>,
-    accumulator: Option<StandardAccumulator>,
+    network: Arc<MobileNetwork>,
     fv_scale: i32,
+    stack: AccumulatorStack,
 }
 
 impl Evaluator {
@@ -23,54 +23,37 @@ impl Evaluator {
         Self { params, nnue: None }
     }
 
-    pub fn nnue(params: EvalParams, network: Arc<StandardNetwork>, fv_scale: i32) -> Self {
-        Self { params, nnue: Some(NnueEvaluator { network, accumulator: None, fv_scale }) }
+    pub fn nnue(params: EvalParams, network: Arc<MobileNetwork>, fv_scale: i32) -> Self {
+        Self {
+            params,
+            nnue: Some(NnueEvaluator { network, fv_scale, stack: AccumulatorStack::default() }),
+        }
     }
 
-    pub fn evaluate(&self, position: &Position) -> i32 {
-        match &self.nnue {
-            Some(nnue) => match &nnue.accumulator {
-                Some(accumulator) => nnue
-                    .network
-                    .evaluate_accumulator(position, accumulator, nnue.fv_scale)
-                    .expect("an incremental NNUE must evaluate a legal search position"),
-                None => nnue
-                    .network
-                    .evaluate(position, nnue.fv_scale)
-                    .expect("a loaded standard NNUE must evaluate a legal search position"),
-            },
+    /// 探索中の局面を評価する。NNUEでは`initialize`後の`advance`/`undo`と対応していること。
+    pub fn evaluate(&mut self, position: &Position) -> i32 {
+        match &mut self.nnue {
+            Some(nnue) => nnue.stack.evaluate(&nnue.network, position, nnue.fv_scale),
             None => evaluate_material(position, self.params),
         }
     }
 
     pub fn initialize(&mut self, position: &Position) {
         if let Some(nnue) = &mut self.nnue {
-            nnue.accumulator = Some(
-                nnue.network
-                    .new_accumulator(position)
-                    .expect("a loaded standard NNUE must initialize a legal search position"),
-            );
+            nnue.stack.reset(&nnue.network, position);
         }
     }
 
-    /// `mv`を適用した直後の`position`へaccumulatorを進める。
+    /// `mv`を適用した直後の`position`をaccumulator stackへ積む。計算は評価時まで遅らせる。
     pub fn advance(&mut self, position: &Position, mv: Move32) {
         if let Some(nnue) = &mut self.nnue {
-            nnue.network
-                .advance_accumulator(
-                    nnue.accumulator.as_mut().expect("NNUE search must be initialized"),
-                    position,
-                    mv,
-                )
-                .expect("a legal searched position must have valid standard NNUE features");
+            nnue.stack.push(position, mv);
         }
     }
 
     pub fn undo(&mut self) {
         if let Some(nnue) = &mut self.nnue {
-            nnue.network.undo_accumulator(
-                nnue.accumulator.as_mut().expect("NNUE search must be initialized"),
-            );
+            nnue.stack.pop();
         }
     }
 

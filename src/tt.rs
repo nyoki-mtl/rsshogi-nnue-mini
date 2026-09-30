@@ -5,7 +5,7 @@
 //! 2語が別々の書き込みから混ざった(torn write)場合、復元したkeymoveは
 //! ほぼ確実に検証に落ちるので、lockなしでも壊れたentryを返さない。
 //!
-//! pack配置(decisionsはtask 0040参照):
+//! pack配置:
 //! - keymove語: [63:32] key検証子(高32bit^低32bitのfold)、[31:0] move32 raw
 //! - data語: [63:48] score(i16)、[47:32] static_eval(i16、`i16::MIN`はNone)、
 //!   [31:24] depth(u8)、[23:22] bound(1=Lower/2=Upper/3=Exact)、[21:16] 世代(6bit)
@@ -37,8 +37,15 @@ pub struct TtEntry {
     pub static_eval: Option<i32>,
 }
 
-const CLUSTER_SIZE: usize = 2;
+/// 16Bのslotを4つで64B、cache line 1本に収める。
+const CLUSTER_SIZE: usize = 4;
 const GENERATION_MASK: u32 = 0x3F;
+/// 同じkeyの結果は、保存済みよりこの深さだけ浅くても新しい結果で置き換える。
+/// 浅い再探索の結果はboundと最善手が新しく、少しの深さの差なら新しさを優先する。
+const SAME_KEY_DEPTH_SLACK: u32 = 2;
+/// 追い出す先を選ぶとき、1世代古いentryをこのdepth分だけ浅いものとみなす。
+const AGE_DEPTH_WEIGHT: i32 = 2;
+const MOVE_MASK: u64 = 0xFFFF_FFFF;
 /// static_evalの`None`を表す番兵。実評価は±`INF`(32,767)に収まり衝突しない。
 const EVAL_NONE: i16 = i16::MIN;
 
@@ -62,8 +69,12 @@ impl Slot {
     }
 }
 
+#[derive(Default)]
+#[repr(align(64))]
+struct Cluster([Slot; CLUSTER_SIZE]);
+
 pub struct TranspositionTable {
-    clusters: Box<[[Slot; CLUSTER_SIZE]]>,
+    clusters: Box<[Cluster]>,
     generation: AtomicU32,
 }
 
@@ -99,7 +110,7 @@ fn encode(entry: &TtEntry, generation: u32) -> (u64, u64) {
 fn decode(key: u64, keymove: u64, data: u64) -> TtEntry {
     let score = i32::from((data >> SCORE_SHIFT) as u16 as i16);
     let eval = (data >> EVAL_SHIFT) as u16 as i16;
-    let depth = u32::from((data >> DEPTH_SHIFT) as u8);
+    let depth = stored_depth(data);
     let bound = match (data >> BOUND_SHIFT) & 0b11 {
         1 => Bound::Lower,
         2 => Bound::Upper,
@@ -124,49 +135,48 @@ fn stored_depth(data: u64) -> u32 {
     u32::from((data >> DEPTH_SHIFT) as u8)
 }
 
+/// keyの検証子が一致するslotと、そこから読んだkeymove語・data語。
+fn find(cluster: &[Slot], key: u64) -> Option<(&Slot, u64, u64)> {
+    let verifier = key_verifier(key);
+    cluster.iter().find_map(|slot| {
+        let data = slot.data.load(Ordering::Relaxed);
+        if data == 0 {
+            return None;
+        }
+        let keymove = slot.guard.load(Ordering::Relaxed) ^ data;
+        ((keymove >> 32) as u32 == verifier).then_some((slot, keymove, data))
+    })
+}
+
 impl TranspositionTable {
     pub fn new(megabytes: usize) -> Self {
         let bytes = megabytes.max(1).saturating_mul(1024 * 1024);
-        let cluster_size = mem::size_of::<[Slot; CLUSTER_SIZE]>().max(1);
-        let cluster_count = (bytes / cluster_size).max(1);
-        let clusters = (0..cluster_count).map(|_| <[Slot; CLUSTER_SIZE]>::default()).collect();
+        let cluster_count = (bytes / mem::size_of::<Cluster>()).max(1);
+        let clusters = (0..cluster_count).map(|_| Cluster::default()).collect();
         Self { clusters, generation: AtomicU32::new(0) }
     }
 
     pub fn probe(&self, key: u64) -> Option<TtEntry> {
-        let verifier = key_verifier(key);
-        for slot in &self.clusters[self.index(key)] {
-            let data = slot.data.load(Ordering::Relaxed);
-            if data == 0 {
-                continue;
-            }
-            let keymove = slot.guard.load(Ordering::Relaxed) ^ data;
-            if (keymove >> 32) as u32 != verifier {
-                continue;
-            }
-            return Some(decode(key, keymove, data));
-        }
-        None
+        find(self.cluster(key), key).map(|(_, keymove, data)| decode(key, keymove, data))
     }
 
     pub fn store(&self, entry: TtEntry) {
         let generation = self.generation.load(Ordering::Relaxed) & GENERATION_MASK;
-        let verifier = key_verifier(entry.key);
         let (new_keymove, new_data) = encode(&entry, generation);
-        let cluster = &self.clusters[self.index(entry.key)];
+        let cluster = self.cluster(entry.key);
 
-        // 同じkeyのslotがあれば、深い結果だけを置き換え、浅ければ世代のみ更新する。
-        for slot in cluster {
-            let data = slot.data.load(Ordering::Relaxed);
-            if data == 0 {
-                continue;
-            }
-            let keymove = slot.guard.load(Ordering::Relaxed) ^ data;
-            if (keymove >> 32) as u32 != verifier {
-                continue;
-            }
-            if entry.depth >= stored_depth(data) {
-                slot.write(new_keymove, new_data);
+        // 同じkeyのslotがあれば、Exactか深さの差が小さい結果で置き換え、
+        // 大きく浅ければ世代だけ更新する。新しい結果に手が無ければ既存の手を残す。
+        if let Some((slot, keymove, data)) = find(cluster, entry.key) {
+            if entry.bound == Bound::Exact
+                || entry.depth + SAME_KEY_DEPTH_SLACK >= stored_depth(data)
+            {
+                let keymove = if entry.best_move.is_some() {
+                    new_keymove
+                } else {
+                    (new_keymove & !MOVE_MASK) | (keymove & MOVE_MASK)
+                };
+                slot.write(keymove, new_data);
             } else {
                 let refreshed = (data & !(u64::from(GENERATION_MASK) << GENERATION_SHIFT))
                     | (u64::from(generation) << GENERATION_SHIFT);
@@ -179,18 +189,17 @@ impl TranspositionTable {
             return;
         }
 
-        // 満杯のclusterでは、古い世代・浅いentryから追い出す。
+        // 満杯のclusterでは、世代の古さで割り引いたdepthが最も小さいentryを追い出す。
+        // 新しい結果は必ず残す。捨てると同じ局面の再探索で手の情報が失われる。
         let victim = cluster
             .iter()
             .min_by_key(|slot| {
                 let data = slot.data.load(Ordering::Relaxed);
-                (stored_generation(data) == generation, stored_depth(data))
+                let age = generation.wrapping_sub(stored_generation(data)) & GENERATION_MASK;
+                stored_depth(data) as i32 - AGE_DEPTH_WEIGHT * age as i32
             })
             .expect("a cluster is non-empty");
-        let old_data = victim.data.load(Ordering::Relaxed);
-        if stored_generation(old_data) != generation || entry.depth >= stored_depth(old_data) {
-            victim.write(new_keymove, new_data);
-        }
+        victim.write(new_keymove, new_data);
     }
 
     pub fn new_search(&self) {
@@ -199,7 +208,7 @@ impl TranspositionTable {
 
     pub fn clear(&self) {
         for cluster in self.clusters.iter() {
-            for slot in cluster {
+            for slot in &cluster.0 {
                 slot.write(0, 0);
             }
         }
@@ -213,23 +222,13 @@ impl TranspositionTable {
     /// XOR trickのテスト用に、keyの載っているslotのdata語を1bit壊す。
     #[cfg(test)]
     fn corrupt_data_for_test(&self, key: u64) {
-        let verifier = key_verifier(key);
-        for slot in &self.clusters[self.index(key)] {
-            let data = slot.data.load(Ordering::Relaxed);
-            if data == 0 {
-                continue;
-            }
-            let keymove = slot.guard.load(Ordering::Relaxed) ^ data;
-            if (keymove >> 32) as u32 == verifier {
-                slot.data.store(data ^ (1 << SCORE_SHIFT), Ordering::Relaxed);
-                return;
-            }
-        }
-        panic!("corrupt_data_for_test: key not found");
+        let (slot, _, data) =
+            find(self.cluster(key), key).expect("corrupt_data_for_test: key not found");
+        slot.data.store(data ^ (1 << SCORE_SHIFT), Ordering::Relaxed);
     }
 
-    fn index(&self, key: u64) -> usize {
-        (key as usize) % self.clusters.len()
+    fn cluster(&self, key: u64) -> &[Slot; CLUSTER_SIZE] {
+        &self.clusters[(key as usize) % self.clusters.len()].0
     }
 }
 
@@ -277,46 +276,71 @@ mod tests {
     }
 
     #[test]
-    fn a_cluster_keeps_two_colliding_entries() {
-        let table = TranspositionTable::new(1);
-        let collision = table.cluster_count() as u64;
-        table.store(entry(5, 6, 60));
-        table.store(entry(5 + collision, 4, 40));
-        assert_eq!(table.probe(5), Some(entry(5, 6, 60)));
-        assert_eq!(table.probe(5 + collision), Some(entry(5 + collision, 4, 40)));
+    fn a_cluster_is_one_cache_line() {
+        assert_eq!(mem::size_of::<Cluster>(), 64);
+        assert_eq!(mem::align_of::<Cluster>(), 64);
     }
 
     #[test]
-    fn a_shallow_current_generation_collision_keeps_deeper_entries() {
+    fn a_cluster_keeps_four_colliding_entries() {
         let table = TranspositionTable::new(1);
         let collision = table.cluster_count() as u64;
-        table.store(entry(5, 6, 60));
-        table.store(entry(5 + collision, 4, 40));
-        table.store(entry(5 + collision * 2, 2, 20));
-        assert_eq!(table.probe(5), Some(entry(5, 6, 60)));
-        assert_eq!(table.probe(5 + collision), Some(entry(5 + collision, 4, 40)));
-        assert_eq!(table.probe(5 + collision * 2), None);
+        for i in 0..4u32 {
+            table.store(entry(5 + collision * u64::from(i), 6 - i, 60));
+        }
+        for i in 0..4u32 {
+            let key = 5 + collision * u64::from(i);
+            assert_eq!(table.probe(key), Some(entry(key, 6 - i, 60)));
+        }
     }
 
     #[test]
-    fn a_new_generation_can_replace_a_stale_entry() {
+    fn a_full_cluster_evicts_the_shallowest_entry_and_keeps_the_new_one() {
+        let table = TranspositionTable::new(1);
+        let collision = table.cluster_count() as u64;
+        for (i, depth) in [6, 4, 8, 7].into_iter().enumerate() {
+            table.store(entry(5 + collision * i as u64, depth, 0));
+        }
+        table.store(entry(5 + collision * 4, 1, 10));
+        assert_eq!(table.probe(5 + collision), None, "最も浅いentryを追い出す");
+        assert_eq!(table.probe(5), Some(entry(5, 6, 0)));
+        assert_eq!(table.probe(5 + collision * 4), Some(entry(5 + collision * 4, 1, 10)));
+    }
+
+    #[test]
+    fn an_old_generation_counts_as_shallower() {
         let table = TranspositionTable::new(1);
         let collision = table.cluster_count() as u64;
         table.store(entry(5, 6, 60));
-        table.store(entry(5 + collision, 4, 40));
         table.new_search();
-        table.store(entry(5 + collision * 2, 1, 10));
-        assert_eq!(table.probe(5), Some(entry(5, 6, 60)));
-        assert_eq!(table.probe(5 + collision), None);
-        assert_eq!(table.probe(5 + collision * 2), Some(entry(5 + collision * 2, 1, 10)));
+        table.new_search();
+        for i in 1..=4 {
+            table.store(entry(5 + collision * i, 3, 0));
+        }
+        assert_eq!(table.probe(5), None, "2世代古いdepth 6はdepth 2相当として追い出す");
+        assert_eq!(table.probe(5 + collision * 4), Some(entry(5 + collision * 4, 3, 0)));
     }
 
     #[test]
-    fn same_key_does_not_replace_a_deeper_entry() {
+    fn same_key_does_not_replace_a_much_deeper_entry() {
         let table = TranspositionTable::new(1);
-        table.store(entry(9, 8, 80));
-        table.store(entry(9, 2, 21));
-        assert_eq!(table.probe(9), Some(entry(9, 8, 80)));
+        let deep = TtEntry { bound: Bound::Lower, ..entry(9, 8, 80) };
+        table.store(deep);
+        table.store(TtEntry { bound: Bound::Upper, ..entry(9, 2, 21) });
+        assert_eq!(table.probe(9), Some(deep));
+    }
+
+    #[test]
+    fn same_key_keeps_the_stored_move_when_the_new_result_has_none() {
+        let table = TranspositionTable::new(1);
+        let mv = Move32::normal(
+            rsshogi::types::Square::new(10),
+            rsshogi::types::Square::new(20),
+            rsshogi::types::Piece::B_SILVER,
+        );
+        table.store(TtEntry { best_move: Some(mv), ..entry(9, 4, 40) });
+        table.store(entry(9, 5, 50));
+        assert_eq!(table.probe(9), Some(TtEntry { best_move: Some(mv), ..entry(9, 5, 50) }));
     }
 
     #[test]

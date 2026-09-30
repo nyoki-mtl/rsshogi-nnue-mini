@@ -2,7 +2,7 @@ name: "rsshogi-nnue-mini baseline dedicated host"
 engine_path: "dist/rsshogi-nnue-mini-tuning-avx2"
 working_directory: "dist"
 options:
-  FV_SCALE: 24
+  FV_SCALE: 16
   SearchAspirationWindow: 80
   SearchReverseFutilityMargin: 140
   SearchFutilityMargin: 180

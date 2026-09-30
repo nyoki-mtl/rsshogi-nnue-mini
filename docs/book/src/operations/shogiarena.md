@@ -1,24 +1,31 @@
-# ShogiArenaでsmoke test、SPSA、SPRT
+# ShogiArenaで対局とパラメータ調整を行う
 
-ShogiArena 1.2.7で検証した設定例を`examples/shogiarena/`に置いている。
-commandはrepository rootから実行する。
+ShogiArenaでUSI対局を確認し、SPSAで候補を作り、未使用の開始局面を使ったSPRTで候補を比較する。
+設定例は`examples/shogiarena/`にあり、ShogiArena 1.2.7での実験を基に探索パラメータの名前を現在のエンジンへ合わせている。
+ShogiArenaは別途導入し、コマンドはリポジトリのルートから実行する。
+使用する版を`shogiarena --version`で記録し、各設定を`--validate-only`で確認してから実行する。
 SPSAの更新式、gain schedule、整数丸め、分散削減、artifact監査、holdout判定は[SPSAの設計と結果の読み方](spsa.md)で説明する。
 
-最初にrelease binaryを`dist/`へ配置し、run directoryをengineのworking directory外に作る。
-ShogiArenaのSPSA archiveへrepository全体を混入させないため、engineの`working_directory`は`dist`に限定している。
+最初にrelease版の実行ファイルを`dist/`へ配置し、実行結果の保存先をエンジンの作業ディレクトリの外に作る。
+設定例はエンジンの`working_directory`を`dist`に限定し、SPSAの保存物へリポジトリ全体が混入することを防ぐ。
+`dist/eval/model.rsnn`には、利用者が別途作成してSHA-256を確認した512幅・ThreatなしSFNNv15 packageを置く。
+`just stage-engine`が配置するのは実行ファイルだけで、評価ファイルはコピーしない。
 
 ```powershell
 just stage-engine
 New-Item -ItemType Directory -Force ..\rsshogi-nnue-mini-runs | Out-Null
 ```
 
-SPSAまたはSPRTのparameter候補を使うときは、tuning binaryとそのstage先を別に作成する。
+SPSAまたはSPRTの設定例は、調整用のAVX2ビルドを参照する。
+AVX2対応CPUを使い、次のレシピで別名の実行ファイルを配置する。
 
 ```powershell
 just release-avx2-tuning
 ```
 
-## 1. USI対局経路をsmoke testする
+AVX2を前提にしない環境では、`just release-tuning`で作り、設定の`engine_path`を`dist/rsshogi-nnue-mini-tuning.exe`へ変更する。
+
+## 1. USI対局の通信を確認する
 
 ```powershell
 shogiarena run tournament ./examples/shogiarena/smoke.yaml --validate-only
@@ -26,14 +33,14 @@ shogiarena run tournament ./examples/shogiarena/smoke.yaml `
   --run-dir ../rsshogi-nnue-mini-runs/tournament-smoke
 ```
 
-同じbinaryを2役で2局だけ対局させ、起動、`usinewgame`、`position`、`go`、`bestmove`、終了を確認する。
+同じ実行ファイルを先後の2役で2局だけ対局させ、起動、`usinewgame`、`position`、`go`、`bestmove`、終了を確認する。
 ここで確認するのは対局経路であり、棋力差はSPRTで測る。
 
-## 2. SPSA protocolを確認する
+## 2. SPSAの通信と記録を確認する
 
-1 update、1 pairだけの`spsa-smoke.yaml`で、manifest handshake、探索parameter 12個と`FV_SCALE`のvariant適用、対局、ledger commit、cleanupを確認する。
-`dist/eval/nn.bin`には、利用者が別途取得してdigestを確認したstandard HalfKP networkを置く。
-SPSAでは`dist`全体がengine runtimeとしてarchiveされるため、run configから`EvalFile`を上書きせず、エンジン既定の`eval/nn.bin`を使う。
+`spsa-smoke.yaml`は更新1回、先後ペア1組だけを実行する。
+これでmanifestの受け渡し、探索パラメータ7個と`FV_SCALE`のvariant適用、対局、ledgerへの記録、後片付けを確認する。
+SPSAでは`dist`全体がengine runtimeとしてarchiveされ、エンジンはその中の`eval/model.rsnn`を使う。
 
 ```powershell
 shogiarena run spsa ./examples/shogiarena/spsa-smoke.yaml --validate-only
@@ -43,7 +50,7 @@ shogiarena run spsa ./examples/shogiarena/spsa-smoke.yaml `
 ```
 
 `--validate-only`は設定を静的に検査し、`--dry-run`は実行計画を確認する。
-続く1 pairのsmoke runで、engineのhandshakeからledger commit、cleanupまでを確認する。
+続く先後ペア1組の対局で、エンジンの初期通信からledgerへの記録、後片付けまでを確認する。
 
 ## 3. SPSAで候補を作る
 
@@ -54,26 +61,27 @@ shogiarena run spsa ./examples/shogiarena/spsa.yaml `
   --run-dir ../rsshogi-nnue-mini-runs/spsa-campaign
 ```
 
-1局面を先後反転したpairとして扱い、同じnode limitを使う。
-`Clear Hash`はtuning binaryが広告するvariant間リセット用buttonとして各variantの適用時に送られる。
-`spsa.yaml`は探索parameter 12個と`FV_SCALE`を同時に動かすcampaign用の初期設定である。
-campaign用の`instances-spsa.yaml`は8対局、16 engine processを上限にする。
-実行時間はmachineとnetworkで変わるため、所要時間を先にsmokeで測り、固定した時間枠へ収まるupdate数に調整する。
+1局面から先後を入れ替えた2局を1ペアとし、同じノード上限を使う。
+`Clear Hash`は、調整用ビルドが公開するvariant間リセット用のUSIオプションで、各variantを適用するときに送られる。
+`spsa.yaml`は、`spsa-space.yaml`の`select`で選んだ探索パラメータ7個と`FV_SCALE`の計8個を同時に動かすための初期設定である。
+manifestにある探索パラメータ35個と時間管理の定数5個のうち、`select`で選んでいない項目は動かさない。
+`instances-spsa.yaml`は、同時実行を8対局、16エンジンプロセスまでに制限する。
+実行時間はマシンとネットワークで変わるため、短い確認対局で所要時間を測り、時間枠へ収まる更新回数を決める。
 
 `manifest.json`、`game.db`、`completion_status.json`、`spsa/ledger.sqlite3`、`spsa/accepted-best.json`を含むrun directory全体を保存する。
 完了判定には`completion_status.json`とledgerを使う。
 dashboardや`state.json`だけではresumeや完了の根拠にならない。
 
-このSPSA例はtuning binaryの固定NNUE経路でparameterを調整する。
+このSPSA例は、調整用ビルドのNNUE評価を固定したままパラメータを調整する。
 
 訓練用定跡は160局面である。
 少数の定跡だけを使うと、その序盤に特化したparameterが選ばれやすい。
 そこで、訓練用とholdoutの定跡を別々のseedから作り、局面の重複も検査する。
 SPSAが出力した候補は`candidate.yaml`へ記録し、次のholdout SPRTで既定値と比較する。
 
-### 専用Linux hostで実行する
+### 専用Linuxホストで実行する
 
-長いcampaignでは、実験前にhost、source revision、tool version、engine binary、NNUEを固定する。
+長い実験では、開始前にホスト、ソースのrevision、ツールの版、実行ファイル、NNUE評価を固定する。
 CPU model、論理CPU数、NUMA構成、memoryも記録し、他の重いprocessが動いていないことを確認する。
 Linux binaryには`.exe` suffixを付けない。ShogiArenaはbinary名もplatform検証に使うため、ELFへ`.exe`を付けると対局開始前に拒否される。
 
@@ -86,7 +94,7 @@ chmod +x dist/rsshogi-nnue-mini-tuning-avx2
 
 rustc --version
 shogiarena --version
-sha256sum dist/rsshogi-nnue-mini-tuning-avx2 dist/eval/nn.bin
+sha256sum dist/rsshogi-nnue-mini-tuning-avx2 dist/eval/model.rsnn
 ```
 
 Linuxでは`engine-tuning-linux.yaml`を使う。
@@ -95,10 +103,11 @@ Linuxでは`engine-tuning-linux.yaml`を使う。
 
 前回より`pairs_per_update`やnode limitを増やす場合は、一度に両方を変えた事実を記録する。
 得られた候補の違いを、どちらの変更によるものか分離できなくなるためである。
-本番開始前に、13 parameter、update数、pair数、node limit、並列数、開始局面、乱数方式、見積り時間を固定する。
+本番開始前に、選択したパラメータ、更新数、ペア数、ノード上限、並列数、開始局面、乱数方式、見積り時間を固定する。
 
 このrepositoryで専用8 vCPU Linux host向けに固定した例は`spsa-dedicated-host.yaml`である。
-280 updates、8 pairs/update、100,000 nodes/game、8対局並列を使う。
+280 updates、8 pairs/update、一手あたり100,000ノード、8対局並列を使う。
+現在の設定は`spsa-space.yaml`を参照し、8パラメータを調整する。
 
 ```bash
 shogiarena run spsa ./examples/shogiarena/spsa-dedicated-host.yaml --validate-only
@@ -111,11 +120,7 @@ SSH切断後も走らせる場合は、標準出力と標準エラーをrun dire
 進捗はlogだけでなくledgerのcommitted updateで確認し、完了は`completion_status.json`の`status: clean`、`termination_reason: completed`、anomaly 0、cleanup cleanをすべて確認する。
 途中の`state.json`やdashboard表示だけを完了根拠にしない。
 
-実測では280 updates、4,480局を約4時間57分でclean完了した。
-ただし、独立holdout SPRTは320局で158勝3分159敗、LLR -0.0462の未決着だった。
-SPSAを大規模化しても候補の改善が保証されるわけではないため、候補を既定値へ反映しなかった。
-
-## 4. SPRT protocolを確認する
+## 4. SPRTの通信と記録を確認する
 
 2局だけの`sprt-smoke.yaml`は、baselineとcandidateの起動、holdout opening、paired result、SPRT stateの記録を確認する。
 
@@ -125,14 +130,17 @@ shogiarena run sprt ./examples/shogiarena/sprt-smoke.yaml `
   --run-dir ../rsshogi-nnue-mini-runs/sprt-protocol-smoke
 ```
 
-2局のsmoke runでは、paired resultとSPRT stateが最後まで記録されることを確認する。
+2局の確認対局では、先後ペアの結果とSPRTの状態が最後まで記録されることを確認する。
 
 ## 5. holdout SPRTで候補を確認する
 
-`spsa/accepted-best.json`から採用候補を`candidate.yaml`へ転記し、学習に使っていない`openings-holdout.sfen`で比較する。
+`spsa/accepted-best.json`の`wire_value`から、候補として送るUSIオプションを`candidate.yaml`へ転記する。
+`baseline.yaml`にも比較基準の値を明示し、学習に使っていない`openings-holdout.sfen`で比較する。
+同梱の2ファイルは過去の比較に由来する値を含むため、そのままでは現在の既定値との比較にならない。
+未指定のオプションには使用する実行ファイルの既定値が使われるので、比較対象の全パラメータを記録する。
 
 holdout定跡は160局面である。
-`flip_policy: pair_both`で先後を入れ替えた2局を1 pairとして扱うため、上限は320局になる。
+`flip_policy: pair_both`で先後を入れ替えた2局を1 pairとして扱い、設定例の`max_games`は320局としている。
 開始局面が少ないと、決定的なengine同士では同じ対局を繰り返すだけになり、pairの結果が分散せずSPRTが統計として成立しない。
 定跡を差し替えるときは、局面数、`max_games`、pentanomialの分散が噛み合っているかを確認する。
 
@@ -142,7 +150,7 @@ shogiarena run sprt ./examples/shogiarena/sprt.yaml `
   --run-dir ../rsshogi-nnue-mini-runs/sprt-holdout
 ```
 
-専用Linux host campaignの候補を再検証するときは、固定済みの設定を使う。
+専用Linuxホストで比較するときは、Linux用の設定例を使い、参照先のbaselineとcandidateも今回の比較条件へ合わせる。
 
 ```bash
 shogiarena run sprt ./examples/shogiarena/sprt-dedicated-host.yaml --validate-only
@@ -158,5 +166,6 @@ H0/H1のElo幅、alpha/beta、最大局数を実験前に固定し、最大局�
 `elo0 = 0`、`elo1 = 5`は近い仮説なので、320局で決着するのは差が大きい場合だけである。
 決着しなかったときは、点推定と信頼区間をSPRTのdecisionとは別の主張として読む。
 
-時間制限のrunはNPSと探索効率を合わせて測り、node制限のrunは探索効率を測る。
-両方を比較すると、棋力差の由来を切り分けられる。
+時間制限の実験は、探索速度と探索効率の両方を含む実戦的な比較になる。
+ノード制限の実験は、一定の探索量でどの程度良い手を選べるかを比べる。
+両方を測ると差の原因を考える材料になるが、並列探索や局面ごとの処理時間も影響するため、原因を完全に分離できるわけではない。

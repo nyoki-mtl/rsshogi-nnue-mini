@@ -5,16 +5,16 @@
 //! 同じ大きさのペナルティを与える。テーブルは対局中`go`をまたいで持続し、
 //! 探索開始ごとに`age`で半減、`usinewgame`で破棄される。
 //!
-//! continuation history(1手前・2手前、piece-toキー)はtask 0041で再挑戦する。
-//! 0035で退行したのは50kノードの浅い探索で表が疎すぎたためで、単一観測の
-//! countermoveをkiller直下の排他層へ置いた設計も同時に効いていた。今回は
-//! 排他層を作らず、main historyへ重み付きで加算する形にしている。
-//! `SearchContinuationWeight`が0の間は並べ替えへ寄与しない。
+//! continuation history(1手前・2手前、piece-toキー)は、並べ替えの独立した層を作らず、
+//! main historyへ`SearchContinuationWeight`の重みで加算する。重みが0なら寄与しない。
+//! 浅い探索では表が疎く、単独の層にすると一度の観測に引きずられるため。
 //!
 //! 静的評価のcorrection historyも同じ寿命でここに置く。
 
 use rsshogi::board::Position;
 use rsshogi::types::{Color, MOVE_NONE, Move32};
+
+use crate::params::SearchParams;
 
 /// gravity更新の飽和上限。`|bonus| <= HISTORY_MAX`なら値はこの範囲を出ない。
 pub(super) const HISTORY_MAX: i32 = 16_384;
@@ -64,8 +64,7 @@ pub(super) fn piece_to_index(mv: Move32) -> usize {
 /// 直前の手に続く静かな手の履歴。1手前・2手前それぞれの表を持つ。
 ///
 /// main historyが「その手自体の良さ」を測るのに対し、これは
-/// 「この手の後にこの手が良い」という組を測る。0035では50kノードの
-/// 浅い探索で疎すぎて学習できず退行したため、深い領域で再挑戦する。
+/// 「この手の後にこの手が良い」という組を測る。
 pub(crate) struct ContinuationHistories {
     /// [直前の手のpiece-to * PIECE_TO_SIZE + この手のpiece-to]。
     tables: [Box<[i16]>; CONTINUATION_PLIES],
@@ -193,20 +192,11 @@ impl CorrectionHistories {
     }
 
     fn age(&mut self) {
-        for side in self.hand.iter_mut() {
-            for entry in side.iter_mut() {
-                *entry /= 2;
-            }
-        }
-        for side in self.pawn.iter_mut() {
-            for entry in side.iter_mut() {
-                *entry /= 2;
-            }
+        for side in self.hand.iter_mut().chain(self.pawn.iter_mut()) {
+            halve(side);
         }
         for side in self.king.iter_mut() {
-            for entry in side.iter_mut() {
-                *entry /= 2;
-            }
+            halve(side);
         }
     }
 }
@@ -218,8 +208,27 @@ fn update_correction(entry: &mut i32, error: i32, weight: i32) {
     *entry = (*entry).clamp(-CORRECTION_MAX, CORRECTION_MAX);
 }
 
+/// βカットのbonus `depth * per_depth - offset`を`[0, max]`へ収める形。
+#[derive(Clone, Copy)]
+struct BonusShape {
+    per_depth: i32,
+    offset: i32,
+    max: i32,
+}
+
+impl BonusShape {
+    fn new(params: &SearchParams) -> Self {
+        Self {
+            per_depth: params.history_bonus_per_depth,
+            offset: params.history_bonus_offset,
+            max: params.history_bonus_max.clamp(0, HISTORY_MAX),
+        }
+    }
+}
+
 /// worker slotごとの履歴テーブル。対局中はUSIセッション側が保持して貸し出す。
 pub(crate) struct HistoryTables {
+    bonus: BonusShape,
     /// [手番][from/toの一意index]。gravity更新で±`HISTORY_MAX`に収まる。
     main: Box<[[i32; FROM_TO_SIZE]; Color::COUNT]>,
     /// 静的評価の補正表。main historyと同じ寿命で持つ。
@@ -232,15 +241,23 @@ pub(crate) struct HistoryTables {
 impl HistoryTables {
     pub(super) fn new() -> Self {
         Self {
+            bonus: BonusShape::new(&SearchParams::default()),
             main: Box::new([[0; FROM_TO_SIZE]; Color::COUNT]),
             corrections: CorrectionHistories::new(),
             continuations: ContinuationHistories::new(),
         }
     }
 
+    /// 探索開始時に、βカットのbonusの形を探索パラメータから取り込む。
+    pub(super) fn configure(&mut self, params: &SearchParams) {
+        self.bonus = BonusShape::new(params);
+    }
+
     /// βカット時のbonus。ペナルティはこの符号反転を使う。
-    fn cutoff_bonus(depth: u32) -> i32 {
-        (i32::try_from(depth).unwrap_or(i32::MAX).saturating_mul(140) - 90).min(1_600)
+    fn cutoff_bonus(&self, depth: u32) -> i32 {
+        let shape = self.bonus;
+        (i32::try_from(depth).unwrap_or(i32::MAX).saturating_mul(shape.per_depth) - shape.offset)
+            .clamp(0, shape.max)
     }
 
     /// 新しい探索の開始時に全エントリを半減する。
@@ -249,9 +266,7 @@ impl HistoryTables {
     /// 重みを下げる。ゼロ方向への切り捨てなので符号は保存される。
     pub(super) fn age(&mut self) {
         for side in self.main.iter_mut() {
-            for entry in side.iter_mut() {
-                *entry /= 2;
-            }
+            halve(side);
         }
         self.corrections.age();
     }
@@ -272,7 +287,7 @@ impl HistoryTables {
         tried_quiets: &[Move32],
         depth: u32,
     ) {
-        let bonus = Self::cutoff_bonus(depth);
+        let bonus = self.cutoff_bonus(depth);
         self.update_quiet(stm, mv, bonus);
         for tried in tried_quiets.iter().copied() {
             debug_assert_ne!(tried, mv, "カットした手自身へはペナルティを与えない");
@@ -292,7 +307,7 @@ impl HistoryTables {
         if previous.iter().all(Option::is_none) {
             return;
         }
-        let bonus = Self::cutoff_bonus(depth);
+        let bonus = self.cutoff_bonus(depth);
         self.continuations.record(previous, piece_to_index(mv), bonus);
         for tried in tried_quiets.iter().copied() {
             self.continuations.record(previous, piece_to_index(tried), -bonus);
@@ -303,6 +318,13 @@ impl HistoryTables {
         if let Some(index) = mv.from_to_index() {
             apply_gravity(&mut self.main[stm.to_index()][index], bonus);
         }
+    }
+}
+
+/// 新しい探索の開始時の減衰。ゼロ方向への切り捨てなので符号は保存される。
+fn halve(entries: &mut [i32]) {
+    for entry in entries {
+        *entry /= 2;
     }
 }
 
@@ -319,7 +341,7 @@ fn apply_gravity(entry: &mut i32, bonus: i32) {
 mod tests {
     use rsshogi::types::{Piece, PieceType, Square};
 
-    /// 補正の適用上限。既定paramsは未採択のため0だが、表の挙動は上限を与えて確かめる。
+    /// 表の挙動を既定paramsから独立に確かめるための補正の適用上限。
     const fn apply_max() -> i32 {
         64
     }
@@ -352,8 +374,8 @@ mod tests {
 
         tables.record_quiet_cutoff(Color::BLACK, cutoff, &tried, 4);
 
-        let bonus = HistoryTables::cutoff_bonus(4);
-        assert_eq!(bonus, 470);
+        let bonus = HistoryTables::new().cutoff_bonus(4);
+        assert_eq!(bonus, 543);
         assert_eq!(tables.quiet_score(Color::BLACK, cutoff), bonus);
         for mv in tried {
             assert_eq!(tables.quiet_score(Color::BLACK, mv), -bonus);
@@ -362,11 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_bonus_grows_with_depth_and_caps_at_1600() {
-        assert_eq!(HistoryTables::cutoff_bonus(1), 50);
-        assert_eq!(HistoryTables::cutoff_bonus(12), 1_590);
-        assert_eq!(HistoryTables::cutoff_bonus(13), 1_600);
-        assert_eq!(HistoryTables::cutoff_bonus(64), 1_600);
+    fn cutoff_bonus_grows_with_depth_and_caps_at_the_maximum() {
+        assert_eq!(HistoryTables::new().cutoff_bonus(1), 75);
+        assert_eq!(HistoryTables::new().cutoff_bonus(11), 1_635);
+        assert_eq!(HistoryTables::new().cutoff_bonus(12), 1_651);
+        assert_eq!(HistoryTables::new().cutoff_bonus(64), 1_651);
     }
 
     #[test]
@@ -402,7 +424,7 @@ mod tests {
 
         tables.record_continuation_cutoff(&previous, cutoff, &tried, 4);
 
-        let bonus = HistoryTables::cutoff_bonus(4);
+        let bonus = HistoryTables::new().cutoff_bonus(4);
         // 1手前と2手前の両方の表に入るので、合計は2倍になる。
         assert_eq!(tables.continuations.score(&previous, cur), bonus * 2);
         assert_eq!(
@@ -513,7 +535,7 @@ mod tests {
 
         tables.record_quiet_cutoff(Color::BLACK, drop, &[], 4);
 
-        assert_eq!(tables.quiet_score(Color::BLACK, drop), HistoryTables::cutoff_bonus(4));
+        assert_eq!(tables.quiet_score(Color::BLACK, drop), HistoryTables::new().cutoff_bonus(4));
     }
 
     #[test]
@@ -522,7 +544,7 @@ mod tests {
         let rewarded = quiet_move(10, 20, Piece::B_SILVER);
         let penalized = quiet_move(30, 40, Piece::B_GOLD);
         tables.record_quiet_cutoff(Color::BLACK, rewarded, &[penalized], 4);
-        let bonus = HistoryTables::cutoff_bonus(4);
+        let bonus = HistoryTables::new().cutoff_bonus(4);
 
         tables.age();
 

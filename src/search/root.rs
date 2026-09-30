@@ -1,14 +1,12 @@
 //! root局面のiteration一回分の探索と、読み筋・fallbackの構成を担う。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use rsshogi::board::Position;
 use rsshogi::types::{MOVE_WIN, Move32};
 
 use crate::tt::{Bound, TtEntry};
 
 use super::context::{SearchContext, tt_key};
-use super::negamax::negamax;
+use super::negamax::search_child;
 use super::score::{declaration_score, score_to_tt, terminal_score};
 use super::{MATE, MAX_PV_LENGTH, legal_moves};
 
@@ -32,7 +30,7 @@ pub(super) fn collect_pv(
         if terminal_score(position, ply, context.limits.max_moves_to_draw).is_some() {
             break;
         }
-        let key = tt_key(position, ply, context.limits.max_moves_to_draw);
+        let key = tt_key(position, context.limits.max_moves_to_draw);
         let Some(mv) = context.table.probe(key).and_then(|entry| entry.best_move) else {
             break;
         };
@@ -79,12 +77,6 @@ pub(super) fn fallback_root_choice(
     (best_move, best_score)
 }
 
-pub(super) fn release_reserved_node(nodes: &AtomicU64, reserved: bool) {
-    if reserved {
-        nodes.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 /// rootのiterationの結果。
 ///
 /// `complete`が偽なら、途中で打ち切られたが`alpha`を更新できた手が残っている。
@@ -104,7 +96,7 @@ pub(super) fn search_root(
 ) -> Option<RootOutcome> {
     let original_alpha = alpha;
     let mut best_move = moves[0];
-    let key = tt_key(position, 0, context.limits.max_moves_to_draw);
+    let key = tt_key(position, context.limits.max_moves_to_draw);
     if let Some(tt_move) = context.table.probe(key).and_then(|entry| entry.best_move)
         && let Some(index) = moves.iter().position(|mv| *mv == tt_move)
     {
@@ -121,24 +113,13 @@ pub(super) fn search_root(
         }
         position.apply_move32(mv);
         context.evaluator.advance(position, mv);
+        let child_depth = depth.saturating_sub(1);
         let child = if index == 0 {
-            negamax(position, depth.saturating_sub(1), -beta, -alpha, 1, [None; 2], context)
-                .map(|v| -v)
+            search_child(position, child_depth, alpha, beta, 1, [None; 2], context)
         } else {
-            let scout = negamax(
-                position,
-                depth.saturating_sub(1),
-                -alpha - 1,
-                -alpha,
-                1,
-                [None; 2],
-                context,
-            )
-            .map(|v| -v);
-            match scout {
+            match search_child(position, child_depth, alpha, alpha + 1, 1, [None; 2], context) {
                 Some(score) if score > alpha && score < beta => {
-                    negamax(position, depth.saturating_sub(1), -beta, -alpha, 1, [None; 2], context)
-                        .map(|v| -v)
+                    search_child(position, child_depth, alpha, beta, 1, [None; 2], context)
                 }
                 other => other,
             }
@@ -180,6 +161,7 @@ pub(super) fn search_root(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rsshogi::board;
 

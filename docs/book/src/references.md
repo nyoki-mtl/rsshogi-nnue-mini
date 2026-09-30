@@ -1,10 +1,9 @@
 # 参照先
 
 - [rsshogi](https://github.com/nyoki-mtl/rsshogi)：盤面、合法手、SFEN。bitboardなど盤面表現の解説もこちらのドキュメントにある
-- [rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi)：USI command model、parser、formatter
-- [rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)：CSA bridge
-- [ShogiArena](https://github.com/nyoki-mtl/ShogiArena)：対局、SPSA、SPRT、dashboard
-- [水匠5評価関数の公式release](https://github.com/yaneurao/YaneuraOu/releases/tag/suisho5)
+- [rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi)：USIコマンドの表現、解析、整形
+- [rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)：CSA中継
+- [ShogiArena](https://github.com/nyoki-mtl/ShogiArena)：対局、SPSA、SPRT、ダッシュボード
 
 ## 探索アルゴリズム
 

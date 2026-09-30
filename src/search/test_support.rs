@@ -9,49 +9,65 @@ use crate::eval::{EvalParams, Evaluator};
 use crate::params::SearchParams;
 use crate::tt::TranspositionTable;
 
-use super::context::SearchContext;
+use super::context::{SearchContext, SharedSearch};
 use super::history::HistoryTables;
-use super::lmr::LmrReductions;
-use super::{SearchControl, SearchEvent, SearchLimits, SearchResult, run};
+use super::{SearchControl, SearchEvent, SearchJob, SearchLimits, SearchResult, run};
 
-pub(crate) fn test_context(nodes: Arc<AtomicU64>, max_nodes: Option<u64>) -> SearchContext {
-    SearchContext {
-        evaluator: Evaluator::material(EvalParams::default()),
-        params: SearchParams::default(),
-        limits: SearchLimits {
-            max_depth: 1,
-            max_nodes,
-            deadline: None,
-            searchmoves: Vec::new(),
-            max_moves_to_draw: 0,
-        },
-        cancel: Arc::new(AtomicBool::new(false)),
-        pondering: Arc::new(AtomicBool::new(false)),
-        nodes,
-        table: Arc::new(TranspositionTable::new(1)),
-        history: HistoryTables::new(),
-        killers: vec![[None; 2]; 20],
-        lmr: LmrReductions::new(SearchParams::default().lmr_divisor),
-        ordering: std::iter::repeat_with(Default::default)
-            .take(crate::position::MAX_SEARCH_PLY as usize + 2)
-            .collect(),
-        continuation: vec![None; crate::position::MAX_SEARCH_PLY as usize + 2],
+/// 深さだけを制限し、node数・時間・候補手・手数の制限を持たないlimits。
+pub(crate) fn depth_limits(max_depth: u32) -> SearchLimits {
+    SearchLimits {
+        max_depth,
+        max_nodes: None,
+        deadline: None,
+        searchmoves: Vec::new(),
+        max_moves_to_draw: 0,
     }
 }
 
-pub(crate) fn run_result(position: Position, limits: SearchLimits, threads: usize) -> SearchResult {
-    let (sender, receiver) = mpsc::channel();
-    run(
-        position,
+pub(crate) fn test_context(nodes: Arc<AtomicU64>, max_nodes: Option<u64>) -> SearchContext {
+    let mut context = SearchContext::new(
         Evaluator::material(EvalParams::default()),
         SearchParams::default(),
-        limits,
-        SearchControl::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false))),
-        sender,
-        Arc::new(TranspositionTable::new(1)),
-        &mut Vec::new(),
-        threads,
+        SearchLimits { max_nodes, ..depth_limits(1) },
+        SharedSearch {
+            cancel: Arc::new(AtomicBool::new(false)),
+            pondering: Arc::new(AtomicBool::new(false)),
+            nodes,
+            table: Arc::new(TranspositionTable::new(1)),
+        },
+        HistoryTables::new(),
     );
+    context.root_depth = 64;
+    context
+}
+
+/// 駒得評価と既定の探索パラメータで探索するjobと、そのeventの受信側。
+pub(crate) fn material_job(
+    position: Position,
+    limits: SearchLimits,
+    control: SearchControl,
+    threads: usize,
+) -> (SearchJob, mpsc::Receiver<SearchEvent>) {
+    let (events, receiver) = mpsc::channel();
+    let job = SearchJob {
+        position,
+        evaluator: Evaluator::material(EvalParams::default()),
+        params: SearchParams::default(),
+        limits,
+        control,
+        events,
+        threads,
+    };
+    (job, receiver)
+}
+
+pub(crate) fn idle_control() -> SearchControl {
+    SearchControl::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)))
+}
+
+pub(crate) fn run_result(position: Position, limits: SearchLimits, threads: usize) -> SearchResult {
+    let (job, receiver) = material_job(position, limits, idle_control(), threads);
+    run(job, Arc::new(TranspositionTable::new(1)), &mut Vec::new());
     receiver
         .into_iter()
         .find_map(|event| match event {

@@ -1,56 +1,75 @@
-# 評価関数（NNUE）
+# 評価関数（`.rsnn`）
 
-探索は一秒間に数十万局面を評価する。
-その一回一回に大きなネットワークを最初から流していては、深さが稼げない。
-NNUEという設計は、この矛盾を「浅いネットワーク」と「差分更新」の二つで解いたものである。
+miniは512幅・Threatなし・PSQTありのSFNNv15 `.rsnn` packageを使用する。評価ファイルはGitには含めず、配布条件を確認したうえでリリース時に別assetとして配布する予定である。内蔵版をビルドした場合は、指定したpackageが実行ファイルに含まれる。
 
-このエンジンはstandard **HalfKP256x32x32**を実装している。
-水匠5の公式releaseで配布される`nn.bin`をそのまま読み、strict loaderで形式を検証し、scalarとAVX2から実行時に選んだkernelで推論する。
-networkは利用者が公式releaseから取得し、実行時の作業ディレクトリにある`eval/nn.bin`へ配置する。
-通常ビルドは`isready`時に読み込み、失敗時は`info string NNUE load error: ...`を出してfail-closedする。
+## 読み込み
 
-評価の中身は四つの章に分けた。
+通常ビルドの既定のパスは、実行時の作業ディレクトリから見た`eval/model.rsnn`である。`embedded-rsnn`ビルドでは、実行ファイル内のpackageを表す`@default`が既定値となる。内蔵版では外部ファイルを配置する必要がない。別のpackageで試す場合は、`isready`の前に次のUSIコマンドを送る。
 
-- [HalfKP特徴量とネットワーク構造](nnue/halfkp.md)：局面をどう125,388次元の疎な入力へ変換し、どんな層を通して1個の評価値にするか
-- [accumulatorの差分更新](nnue/accumulator.md)：一手指すたびに全部を計算し直さずに済む理由と、その正しさの確かめ方
-- [量子化推論とAVX2](nnue/inference.md)：整数だけで推論する仕組みと、実行時にkernelを選ぶ設計
-- [厳密な読み込みと水匠5互換性](nnue/loader.md)：`nn.bin`をどこまで検証してから信用するか
+```text
+setoption name EvalPackage value C:\path\to\model.rsnn
+isready
+```
 
-## 評価関数は一つではない
+読み込み時にcontainerのdigest、評価仕様、tensorの名前・型・形状と数値範囲の証明、`kp-progress.bin`を検証する。
+未対応の形式や破損したpackageでは`readyok`を返さず、`go`には`bestmove resign`を返す。
+`EvalPackage`を変更すると読み込み済みモデルと探索履歴を破棄する。
 
-NNUEを読み込むと、駒の価値は要らなくなるように思える。
-実際にはそうならない。
-探索の中では、性質の違う二つの評価が並走している。
+package内部の検証は破損と仕様違いを検出するが、期待する学習runのモデルかどうかは判定できない。
+利用者は期待するpackageのSHA-256を別に記録し、配置後に照合する。
 
-一つは葉の評価である。
-静止探索が到達した局面に点数を付ける仕事で、通常ビルドではNNUEが担う。
-もう一つは手の粗い見積もりである。
-move orderingで捕獲の価値を比べるとき、SEEで取り合いの損得を畳み込むとき、futilityやdelta pruningのmarginを測るとき、探索は局面ではなく「この手が動かす駒」の値段を知りたい。
-NNUEは局面全体を写像する関数なので、一手分の値段を切り出せない。
-そこで**駒割り**（歩100、香300、桂320、銀450、金550、角800、飛1,000、成り+350）を8個のparameterとして別に持ち、こちらを手の見積もりに使う。
+## 推論
 
-つまりNNUEの導入は駒割りを置き換えたのではなく、駒割りの仕事を「葉の評価」から「手の見積もり」へ狭めた。
-SEEや枝刈りの側から見ると、評価関数は今も駒割りである。
+HalfKA_hm direct特徴を双方の視点で抽出し、KP進行度で8個の出力層から1つを選ぶ。
+512幅の量子化feature transformer、二段の全結合層、PSQT差分を整数演算で評価する。
+参照consumerと同じ評価値を出す`FV_SCALE`は16で、通常ビルドの既定値は21である。
+探索の枝刈りmarginと合わせて尺度を調整した結果、表示される通常評価の数値は尺度16の場合より約24%小さくなる。
 
-## 評価値の定義域と詰みscoreの分離
+探索中は特徴を毎回抽出し直さない。着手ごとに変わる特徴（動いた駒と、取った駒が持ち駒になる分）だけを記録し、評価するときにまとめてaccumulatorへ反映する。自玉が動くとその視点の特徴番号がすべて変わるため、自玉のマスごとに最後に作ったaccumulatorを覚えておき、そこからの駒配置の差分で作り直す。
 
-NNUEの出力は手番側から見たcentipawn相当の整数で、`-31753..=31753`へclampする。
-この上限はYaneuraOuの`VALUE_MAX_EVAL`と同じ値である。
+## ベクトル命令
 
-31,753という半端な値を選ぶ理由は、探索のscore設計にある。
-探索は詰みを`32000 - 手数`で表すので、31,754以上は「詰みまでの距離」を運ぶ帯として予約されている。
-通常評価がこの帯へ届いてしまうと、置換表が評価値を詰みと誤認して手数補正をかける。
-clampはこの衝突を構造的に排除する（scoreの帯全体は[探索](search.md)を参照）。
+feature transformerの加減算、二つの半分の積によるpooling、全結合層の積和を、ビルド時に選んだ命令で実行する。どの経路もscalar実装と同じ整数値を返す。
 
-material評価も同じ定義域へclampしてから返す。
-どちらの評価器でも、探索から見た値の意味は変わらない。
+poolingの出力は0が多いため、AVX2経路の全結合層は、4入力ごとのまとまりのうち0でないものの位置を先に表引きで並べ、その位置だけを積和する。
+着手による差分は視点ごとに1組か2組なので、その数を固定した経路でaccumulatorを更新する。
 
-## FV_SCALE
+| ビルド | 経路 |
+| --- | --- |
+| x86-64、`-C target-feature=+avx2` | AVX2 |
+| aarch64（iOS、Android、Apple Silicon） | NEON。全結合層はCPUが`dotprod`を持てば`sdot` |
+| 上記以外 | scalar |
 
-networkの生の出力は、そのままではcentipawnにならない。
-学習時のscaleを打ち消すため、出力を**FV_SCALE**で割ってから使う。
-水匠5の公式配布物はこの値として24を指定しており、通常ビルドは24へ固定する。
+aarch64ではNEONが必ず使えるため、追加の指定なしでNEON経路になる。`dotprod`（Armv8.2のint8内積命令）は起動後にOSへ問い合わせて判定するので、同じ実行ファイルが対応端末では`sdot`を、非対応端末では従来のNEON命令を使う。対象端末がすべて対応していると分かっている場合は、`-C target-feature=+dotprod`で判定を省ける。この指定をした実行ファイルは非対応CPUで不正命令により停止する。iOSとAndroid向けのcompile確認は次で行う。
 
-固定にしているのは、この値が「調整するparameter」ではなく「networkに付属する定数」だからである。
-配布されたnetworkと違うFV_SCALEで動かすと、それは互換動作ではなく別の評価関数になる。
-SPSAでFV_SCALEや探索parameterを振りたいときだけ、`--features tuning`で作った別のtuning binaryを使う。
+```powershell
+just check-mobile
+```
+
+NEON経路の数値一致はQEMU上のaarch64で確認している。iPhoneやAndroid実機での速度とメモリは未測定である。
+
+## 実モデル検証
+
+試験学習packageをローカルに用意した場合、fixture付きの検証は次で実行できる。現在のfixture testは2026年9月の100ステップ試験packageのdigestに固定されている。
+
+```powershell
+$env:RSSHOGI_RSNN_FIXTURE = (Resolve-Path ./path/to/pilot.rsnn).Path
+cargo test pilot_package_evaluates_startpos -- --ignored
+```
+
+この試験は試験学習packageの読み込みと局面評価の一致を確認するものである。
+84エポックの本学習packageは、学習時に固定版のrevision不一致で検査が失敗した。
+固定版を揃えた後の再検査では、package digest、評価仕様、revisionの照合と、それぞれの不一致を拒否する検査を通過した。
+miniでは本学習packageの5局面の評価値が参照実装と一致し、実モデルを使った6,000回のランダム操作（着手・取り消し・null手）で差分更新と全再計算の一致を確認した。
+この検査はFloodgateでの棋力やモバイル実機の速度を保証しない。
+
+リリース候補のpackageのSHA-256は`a4a61c91f85a1ee1eb67cb7c6483c66fdb6ed7c2832d3184901e2faf89dfb398`である。
+同じpackageを用意した場合、mini側の実モデル検証を次で再実行できる。
+
+```powershell
+$env:RSSHOGI_RSNN_RELEASE_CANDIDATE = (Resolve-Path ./path/to/model.rsnn).Path
+cargo test release_candidate_matches_reference_consumer -- --ignored
+cargo test release_candidate_incremental_evaluation_matches_full_refresh -- --ignored
+```
+
+検証の経緯と対局結果は[開発時の測定結果](verification.md)を参照。

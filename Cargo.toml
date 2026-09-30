@@ -11,12 +11,14 @@ publish = false
 [features]
 default = []
 tuning = []
+embedded-rsnn = []
 
 [workspace]
 
 [dependencies]
-rsshogi = "=1.2.3"
+rsshogi = "=1.2.5"
 rsshogi-usi = "=0.2.0"
+rsnn-package = { path = "crates/rsnn-package" }
 
 [profile.release]
 lto = "thin"
