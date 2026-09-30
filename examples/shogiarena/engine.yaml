@@ -1,4 +1,0 @@
-name: "rsshogi-nnue-mini"
-engine_path: "dist/rsshogi-nnue-mini.exe"
-working_directory: "dist"
-options: {}

@@ -1,6 +1,0 @@
-name: local
-type: local
-slots: 2
-max_engines: 2
-tags: ["local"]
-is_strict_host_key_checking: true

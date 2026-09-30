@@ -1,7 +1,7 @@
 [book]
-title = "rsshogi-nnue-mini Book"
+title = "rsshogi-nnue-mini の使い方"
 authors = ["rsshogi contributors"]
-description = "小さな将棋エンジンで現代的な開発サイクルをたどる"
+description = "rsshogi-nnue-mini の導入と設定"
 language = "ja"
 src = "src"
 

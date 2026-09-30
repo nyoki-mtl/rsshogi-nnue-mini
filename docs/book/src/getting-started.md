@@ -1,112 +1,39 @@
 # 動かしてみる
 
-## 必要なもの
+## 準備
 
-- Rust 1.95以降
-- WindowsではMSVCツールチェーン
-- 対応する512幅・Threatなし・PSQTありSFNNv15の`.rsnn`評価ファイル（このリポジトリには同梱していない）
-- `just`のレシピを使う場合は、`just`とPowerShell 7
+Rust 1.95以降を用意します。WindowsではMSVCツールチェーンが必要です。
 
-以下はWindowsのPowerShellで、リポジトリのルートから実行する例である。
+[評価ファイル 2026.09.30](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/eval-2026.09.30)から`rsshogi-nnue-mini-eval-20260930.rsnn`をダウンロードし、リポジトリ内の`eval/model.rsnn`に名前を変えて置きます。`eval`フォルダーがなければ作成してください。
 
-## 評価ファイルを準備する
+## ビルド
 
-Floodgateで使用した84エポックの`.rsnn`を[評価ファイルのRelease](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/model-84e-20260930)から取得し、リポジトリ内の`eval/model.rsnn`へ置く。
-公開リポジトリのソースコードには学習済みモデルも作成ツールも含まれない。
-別の場所に置く場合は、`isready`の前に`setoption name EvalPackage value <path>`を送る。
-配置後にSHA-256が`a4a61c91f85a1ee1eb67cb7c6483c66fdb6ed7c2832d3184901e2faf89dfb398`と一致することを確認する。
+リポジトリのルートで実行します。
 
 ```powershell
-Get-FileHash -Algorithm SHA256 ./eval/model.rsnn
+cargo build --release --locked
 ```
 
-この章の直接実行では、作業ディレクトリはリポジトリのルートである。
-通常ビルドと調整用ビルドは、ともにその下の`eval/model.rsnn`を既定で読む。
-実行ファイルの場所を基準に探すわけではないため、GUIから起動する場合も作業ディレクトリを確認する。
-別の評価ファイルを使う場合は、そのファイルに対応するSHA-256と照合する。
+Windowsの実行ファイルは`target/release/rsshogi-nnue-mini.exe`です。Linuxでは末尾の`.exe`を外します。
 
-## ビルドして起動する
+## 将棋GUIに登録する
 
-```powershell
-cargo build --release
-./target/release/rsshogi-nnue-mini.exe
-```
+ビルドした実行ファイルをUSIエンジンとして登録します。エンジンが評価ファイルを見つけられるよう、作業ディレクトリをリポジトリのルートに設定してください。GUIで作業ディレクトリを指定できない場合は、エンジンの設定画面で`EvalPackage`に`model.rsnn`の絶対パスを指定します。
 
-Linuxでは、実行ファイル名の末尾の`.exe`を外す。
+起動時に`readyok`が返らない場合は、評価ファイルの場所と`EvalPackage`の値を確認してください。エンジンは読み込みに失敗した理由を`info string NNUE load error: ...`として出力します。
 
-## USIで探索を確認する
+## コマンドで動作を確認する
 
-起動したエンジンへ、次の順に入力する。
-まず`usi`を送り、オプション一覧に続く`usiok`を待つ。
+実行ファイルを起動して、次を一行ずつ入力します。`isready`への`readyok`を待ってから次へ進んでください。
 
 ```text
 usi
-```
-
-次に`isready`を送り、評価ファイルの読み込み完了を示す`readyok`を待つ。
-
-```text
 isready
-```
-
-`readyok`を確認してから、対局の初期化、局面の設定、探索開始を送る。
-
-```text
 usinewgame
-position startpos moves 7g7f 3c3d
+position startpos
 go depth 3
 ```
 
-`info`に続いて`bestmove`が返れば、この探索は完了している。
-途中で止める場合は`stop`を送り、その応答の`bestmove`を待つ。
-終了するときは、最後に`quit`を送る。
-`go`の直後に`quit`まで一括入力すると、探索結果を受け取る前に終了することがある。
+`bestmove`が返れば探索は完了です。最後に`quit`を入力します。
 
-複数ワーカーで動かす場合は、探索開始前に`setoption name Threads value 2`を送る。
-オプションの詳細は[USI](usi.md)、停止処理の構成は[実行時の構成](architecture.md)を参照。
-
-## 評価ファイルを読み込めない場合
-
-読み込みに失敗すると、`info string NNUE load error: ...`を出し、`readyok`を返さない。
-この状態で`go`を送ると`bestmove resign`を返す。
-エラーを確認してファイルを配置し直し、再度`isready`を送る。
-
-## 対局ツール用の実行ファイルを用意する
-
-配布・性能測定用の実行ファイルは`dist/`を使う。`target/release/`はCargoのビルド中間出力である。
-手元の`.rsnn`を内蔵したAVX2版は、次のレシピで`dist/rsshogi-nnue-mini-embedded-avx2.exe`に作る。
-
-```powershell
-just release-avx2-embedded "C:\path\to\model.rsnn"
-```
-
-モデルのSHA-256は`dist/rsshogi-nnue-mini-embedded-avx2.json`に記録され、起動時にも内蔵バイト列と照合される。
-AVX2対応CPUでは`EvalPackage`を設定せずに使える。
-モデルをGitへ追加したり、`dist/eval/`へ別途コピーしたりする必要はない。
-
-外部ファイルを読む通常版は、次のレシピで`dist/rsshogi-nnue-mini.exe`へ配置できる。
-
-```powershell
-just stage-engine
-```
-
-通常版がコピーするのは実行ファイルだけである。
-対局ツール向けの設定例では、直接実行時と違って作業ディレクトリを`dist/`にする。
-その設定で通常版を使う場合は、`dist/eval/model.rsnn`を別途配置する。
-SPSAでパラメータを調整する場合は、[ShogiArenaの手順](operations/shogiarena.md)に従って調整用ビルドを用意する。
-
-## テストと文書のビルド
-
-```powershell
-cargo test --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-`--workspace`は、`.rsnn`の読み取りと検証を担う`crates/rsnn-package`のtestも含める。
-通常の`cargo test`では、実`.rsnn`を必要とする検証は実行しない。fixtureを用いた検証方法は[評価関数](nnue.md)を参照。
-文書は`mdbook`を導入してから、次のコマンドでビルドできる。
-
-```powershell
-mdbook build docs/book
-```
+評価ファイルの配置とハッシュの確認方法は[評価ファイル](nnue.md)、スレッド数などの設定は[USIオプション](usi.md)を参照してください。
