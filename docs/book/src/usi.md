@@ -4,7 +4,7 @@
 
 | オプション | 既定値 | 用途 |
 | --- | --- | --- |
-| `EvalPackage` | `eval/model.rsnn` | 評価ファイルのパス。別の場所に置いた場合は絶対パスを指定 |
+| `EvalPackage` | 通常版は`eval/model.rsnn`、内蔵版は`@default` | 評価ファイルのパス。通常版で別の場所に置いた場合は絶対パスを指定 |
 | `Threads` | 1 | 探索に使うスレッド数（1〜16） |
 | `USI_Hash` | 16 | 置換表に使うメモリ（1〜1024 MiB） |
 | `USI_Ponder` | false | GUIが先読みを使う場合に有効化 |
