@@ -1,6 +1,16 @@
 # Summary
 
 - [はじめに](introduction.md)
-- [動かしてみる](getting-started.md)
-- [評価ファイル](nnue.md)
+- [セットアップ](getting-started.md)
+- [実行時の構成](architecture.md)
+- [評価関数](nnue.md)
+- [探索](search.md)
+  - [alpha-beta法とPVS](search/alphabeta.md)
+  - [手の並べ替えとSEE](search/ordering.md)
+  - [枝刈りと探索深さの調整](search/pruning.md)
+  - [静止探索](search/qsearch.md)
+  - [置換表と千日手](search/tt.md)
+  - [時間管理](search/time.md)
+  - [Lazy SMPによる並列探索](search/parallel.md)
 - [USIオプション](usi.md)
+- [参考資料](references.md)

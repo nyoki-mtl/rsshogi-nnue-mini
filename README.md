@@ -1,40 +1,30 @@
 # rsshogi-nnue-mini
 
-Rust製のUSI将棋エンジンです。将棋GUIに登録して対局できます。
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-0969da?logo=github)](https://nyoki-mtl.github.io/rsshogi-nnue-mini/)
 
-[rsshogi](https://github.com/nyoki-mtl/rsshogi)で盤面と指し手を扱い、[rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi)でUSIコマンドを解析・整形します。CSA接続には[rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)、ローカル対局やパラメータ調整には[ShogiArena](https://github.com/nyoki-mtl/ShogiArena)を組み合わせます。
+[rsshogi](https://github.com/nyoki-mtl/rsshogi)、[rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi)、[rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)、[ShogiArena](https://github.com/nyoki-mtl/ShogiArena)を組み合わせ、エンジンの実装から対局・調整までを試せる小さなUSIエンジンです。
+反復深化、PVS、qsearch、置換表、主要な枝刈り、Lazy SMPと、512幅のNNUE評価を実装しています。
 
-## 動かす
+## セットアップ
 
-Rust 1.95以降が必要です。WindowsではMSVCツールチェーンを使います。実行ファイルはソースコードからビルドします。
+WindowsのAVX2対応CPUで使う手順です。Rust 1.95以降、PowerShell 7、MSVCツールチェーンが必要です。
 
-[評価ファイル 2026.09.30](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/eval-2026.09.30)から`.rsnn`をダウンロードします。通常版と、評価ファイルを内蔵するAVX2版の二通りがあります。
+1. [評価関数 2026.09.30](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/eval-2026.09.30)から`rsshogi-nnue-mini-eval-20260930.rsnn`をダウンロードします。
+2. リポジトリのルートで次を実行します。`-ModelPath`にはダウンロードしたファイルのパスを指定してください。
 
-### 通常版
+   ```powershell
+   pwsh -NoProfile -File scripts/build_embedded_avx2.ps1 -ModelPath "C:\path\to\rsshogi-nnue-mini-eval-20260930.rsnn"
+   ```
 
-ダウンロードしたファイルをリポジトリ内の`eval/model.rsnn`に名前を変えて置き、ルートでビルドします。
+3. 作成された`dist/rsshogi-nnue-mini-embedded-avx2.exe`を将棋GUIにUSIエンジンとして登録します。
 
-```powershell
-cargo build --release --locked
-```
+評価関数は実行ファイルに内蔵されるため、対局時に`.rsnn`を置く必要はありません。
 
-`target/release/rsshogi-nnue-mini.exe`を将棋GUIに登録します。Linuxでは末尾の`.exe`を外してください。評価ファイルは起動時の作業ディレクトリを基準に探すため、GUIから読み込めない場合はUSIオプション`EvalPackage`に絶対パスを指定します。
+詳しくは[セットアップガイド](docs/book/src/getting-started.md)と[USIオプション](docs/book/src/usi.md)を参照してください。
 
-### 評価ファイル内蔵版（Windows、AVX2）
+## 対局記録
 
-WindowsとAVX2対応CPUでは、PowerShell 7から次を実行すると、評価ファイルを内蔵した`dist/rsshogi-nnue-mini-embedded-avx2.exe`を作れます。この版は起動時に外部の`.rsnn`を必要としません。Floodgateで使ったのも内蔵版です。
-
-```powershell
-pwsh -NoProfile -File scripts/build_embedded_avx2.ps1 -ModelPath "C:\path\to\rsshogi-nnue-mini-eval-20260930.rsnn"
-```
-
-詳しい手順は[動かしてみる](docs/book/src/getting-started.md)、主な設定は[USIオプション](docs/book/src/usi.md)を参照してください。
-
-## エンジンについて
-
-複数スレッドでの探索と先読みに対応しています。評価ファイルはGitには含めず、Releaseから配布しています。
-
-[Floodgateでの対局記録](https://wdoor.c.u-tokyo.ac.jp/shogi/x/2026/player/rss-mini-84e-20260929+72a7fa5.html)では、2026年9月30日の確認時点でR3444でした。この値は当時の構成と対局条件での結果です。
+2026年10月1日に確認した[FloodgateレートはR3447](https://wdoor.c.u-tokyo.ac.jp/shogi/x/2026/player/rss-mini-84e-20260929+72a7fa5.html)です。
 
 ## ライセンス
 

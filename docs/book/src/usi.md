@@ -4,7 +4,6 @@
 
 | オプション | 既定値 | 用途 |
 | --- | --- | --- |
-| `EvalPackage` | 通常版は`eval/model.rsnn`、内蔵版は`@default` | 評価ファイルのパス。通常版で別の場所に置いた場合は絶対パスを指定 |
 | `Threads` | 1 | 探索に使うスレッド数（1〜16） |
 | `USI_Hash` | 16 | 置換表に使うメモリ（1〜1024 MiB） |
 | `USI_Ponder` | false | GUIが先読みを使う場合に有効化 |
@@ -12,11 +11,4 @@
 | `EnteringKingRule` | `CSARule27` | 入玉宣言の規則 |
 | `MaxMovesToDraw` | 0 | 指定手数を超えた局面を引き分けとする。0は無効 |
 
-たとえば評価ファイルを別の場所に置く場合は、次のように設定します。
-
-```text
-setoption name EvalPackage value C:\shogi\model.rsnn
-isready
-```
-
-全オプションと選択できる値は、エンジンへ`usi`を送ると表示されます。評価ファイルが読み込めない場合は[評価ファイル](nnue.md)を参照してください。
+全オプションと選択できる値は、エンジンへ`usi`を送ると表示されます。

@@ -1,5 +1,7 @@
 # はじめに
 
-`rsshogi-nnue-mini`は、将棋GUIで使えるRust製のUSI将棋エンジンです。
+`rsshogi-nnue-mini`は、[rsshogi](https://github.com/nyoki-mtl/rsshogi)と[rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi)で作ったUSI将棋エンジンです。
+[rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)でのCSA接続や[ShogiArena](https://github.com/nyoki-mtl/ShogiArena)での対局・調整と組み合わせて使う一例として公開しています。
 
-まず[動かしてみる](getting-started.md)で評価ファイルの配置とビルドを済ませてください。評価ファイルを別の場所に置く場合や、探索に使うスレッド数を変える場合は[USIオプション](usi.md)を参照してください。
+使い始めるには[セットアップ](getting-started.md)を参照してください。
+仕組みを知りたい場合は[実行時の構成](architecture.md)、[評価関数](nnue.md)、[探索](search.md)から読めます。
