@@ -44,9 +44,9 @@ pub(crate) fn dense<const IN: usize>(
     output: &mut [i32; DENSE_OUTPUTS],
 ) {
     *output = *bias;
-    for (chunk, inputs) in input.chunks_exact(4).enumerate() {
+    for (chunk, inputs) in input.as_chunks::<4>().0.iter().enumerate() {
         let block = &weights[chunk * DENSE_OUTPUTS * 4..][..DENSE_OUTPUTS * 4];
-        for (value, row) in output.iter_mut().zip(block.chunks_exact(4)) {
+        for (value, row) in output.iter_mut().zip(block.as_chunks::<4>().0.iter()) {
             *value += row
                 .iter()
                 .zip(inputs)

@@ -147,7 +147,7 @@ impl SearchContext {
                 return None;
             }
             self.nodes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nodes| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |nodes| {
                     (nodes < limit).then_some(nodes + 1)
                 })
                 .ok()?;

@@ -137,15 +137,13 @@ impl AonlyNetwork {
             digest: tensors.digest,
             base_weights: tensors
                 .base_weights
-                .chunks_exact(WIDTH)
-                .map(|column| CompactColumn(column.try_into().expect("1024 lanes")))
+                .as_chunks::<WIDTH>()
+                .0
+                .iter()
+                .map(|column| CompactColumn(*column))
                 .collect(),
             biases: Column(tensors.biases.as_slice().try_into().expect("1024 biases")),
-            psqt_weights: tensors
-                .psqt_weights
-                .chunks_exact(BUCKETS)
-                .map(|column| column.try_into().expect("8 buckets"))
-                .collect(),
+            psqt_weights: tensors.psqt_weights.as_chunks::<BUCKETS>().0.to_vec(),
             progress_weights: tensors.progress_weights,
             stacks,
         }
@@ -374,14 +372,11 @@ fn chunk_major(rows: &[i8], inputs: usize) -> Vec<i8> {
 }
 
 fn decode_i16(bytes: &[u8]) -> Vec<i16> {
-    bytes.chunks_exact(2).map(|part| i16::from_le_bytes([part[0], part[1]])).collect()
+    bytes.as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes).collect()
 }
 
 fn decode_i32(bytes: &[u8]) -> Vec<i32> {
-    bytes
-        .chunks_exact(4)
-        .map(|part| i32::from_le_bytes(part.try_into().expect("four bytes")))
-        .collect()
+    bytes.as_chunks::<4>().0.iter().copied().map(i32::from_le_bytes).collect()
 }
 
 fn decode_progress(bytes: &[u8]) -> Result<Vec<i32>, String> {

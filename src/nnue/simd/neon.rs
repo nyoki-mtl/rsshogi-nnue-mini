@@ -175,8 +175,8 @@ fn dense_with<const IN: usize>(
     // SAFETY: bias holds 32 i32 values, read as eight 4-lane registers.
     let mut sums: [int32x4_t; 8] =
         std::array::from_fn(|index| unsafe { vld1q_s32(bias.as_ptr().add(index * 4)) });
-    for (chunk, inputs) in input.chunks_exact(4).enumerate() {
-        let packed = u32::from_le_bytes(inputs.try_into().expect("four inputs"));
+    for (chunk, inputs) in input.as_chunks::<4>().0.iter().enumerate() {
+        let packed = u32::from_le_bytes(*inputs);
         // Pooled activations are often zero; skipping their chunk is exact.
         if packed == 0 {
             continue;

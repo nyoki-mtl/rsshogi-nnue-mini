@@ -179,8 +179,8 @@ fn trained_inference_profile() {
         let mut x2 = [0; FC2_INPUTS];
         x2[..FC1_INPUTS].copy_from_slice(&x1);
         paired_activation(&z1, 6, (&mut x2[FC1_INPUTS..]).try_into().expect("second activation"));
-        let nz0 = input.chunks_exact(4).filter(|x| x.iter().any(|&v| v != 0)).count();
-        let nz1 = x1.chunks_exact(4).filter(|x| x.iter().any(|&v| v != 0)).count();
+        let nz0 = input.as_chunks::<4>().0.iter().filter(|x| x.iter().any(|&v| v != 0)).count();
+        let nz1 = x1.as_chunks::<4>().0.iter().filter(|x| x.iter().any(|&v| v != 0)).count();
         println!("DENSITY bucket={bucket} fc0={nz0}/{} fc1={nz1}/{}", WIDTH / 4, FC1_INPUTS / 4);
         samples.push((columns, psqt, progress, bucket, input, x1, x2, position));
     }
