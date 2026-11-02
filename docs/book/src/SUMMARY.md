@@ -2,6 +2,7 @@
 
 - [はじめに](introduction.md)
 - [セットアップ](getting-started.md)
+- [アプリへの組み込み](embedding.md)
 - [実行時の構成](architecture.md)
 - [評価関数](nnue.md)
 - [探索](search.md)

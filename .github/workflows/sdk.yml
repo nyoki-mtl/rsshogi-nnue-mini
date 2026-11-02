@@ -1,0 +1,158 @@
+name: SDK checks and build artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      embed_model:
+        description: Embed the private model from MINI_MODEL_URL (explicit dispatch only)
+        type: boolean
+        default: false
+      model_sha256:
+        description: Expected lowercase SHA-256 of that model
+        type: string
+        default: ''
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'Cargo.*'
+      - 'include/**'
+      - 'bindings/**'
+      - 'scripts/build_*'
+      - 'scripts/check_*'
+      - 'scripts/fetch_build_model.py'
+      - '.github/workflows/sdk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch explicitly requested pinned model
+        if: github.event_name == 'workflow_dispatch' && inputs.embed_model
+        env:
+          MINI_MODEL_URL: ${{ secrets.MINI_MODEL_URL }}
+          MINI_MODEL_SHA256: ${{ inputs.model_sha256 }}
+        run: python scripts/fetch_build_model.py
+      - run: cargo test --locked --workspace --features c-api
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets --features c-api -- -D warnings
+      - name: Package Windows SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build_sdk.ps1
+      - name: Check packaged Windows C ABI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $arguments = @('--library', 'dist/sdk/x86_64-pc-windows-msvc')
+          if ($env:RSSHOGI_EMBEDDED_RSNN_PATH) { $arguments += @('--model', $env:RSSHOGI_EMBEDDED_RSNN_PATH) }
+          python scripts/check_native.py @arguments
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build native C ABI
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          features=c-api
+          if [[ -n "${RSSHOGI_EMBEDDED_RSNN_PATH:-}" ]]; then features+=,embedded-rsnn; fi
+          cargo rustc --locked --lib --crate-type cdylib --features "$features"
+      - name: Check native C ABI lifecycle and errors
+        if: runner.os != 'Windows'
+        shell: pwsh
+        run: |
+          $arguments = @('--library', 'target/debug')
+          if ($env:RSSHOGI_EMBEDDED_RSNN_PATH) { $arguments += @('--model', $env:RSSHOGI_EMBEDDED_RSNN_PATH) }
+          python scripts/check_native.py @arguments
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: windows-x86_64-sdk
+          path: dist/sdk/x86_64-pc-windows-msvc/
+          if-no-files-found: error
+
+  apple:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,aarch64-apple-darwin
+      - name: Require Apple Silicon runtime checks
+        run: test "$(uname -m)" = arm64
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch explicitly requested pinned model
+        if: github.event_name == 'workflow_dispatch' && inputs.embed_model
+        env:
+          MINI_MODEL_URL: ${{ secrets.MINI_MODEL_URL }}
+          MINI_MODEL_SHA256: ${{ inputs.model_sha256 }}
+        run: python scripts/fetch_build_model.py
+      - name: Package XCFramework, type-check Swift 6 wrapper, and run host smoke
+        run: bash scripts/build_apple.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apple-sdk
+          path: dist/apple/
+          if-no-files-found: error
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch explicitly requested pinned model
+        if: github.event_name == 'workflow_dispatch' && inputs.embed_model
+        env:
+          MINI_MODEL_URL: ${{ secrets.MINI_MODEL_URL }}
+          MINI_MODEL_SHA256: ${{ inputs.model_sha256 }}
+        run: python scripts/fetch_build_model.py
+      - name: Package Wasm SDK
+        shell: pwsh
+        run: |
+          if ($env:RSSHOGI_EMBEDDED_RSNN_PATH) {
+            ./scripts/build_wasm.ps1 -ModelPath $env:RSSHOGI_EMBEDDED_RSNN_PATH
+          } else {
+            ./scripts/build_wasm.ps1
+          }
+      - name: Check explicitly requested model in Wasm
+        if: github.event_name == 'workflow_dispatch' && inputs.embed_model
+        run: node scripts/check_wasm.mjs dist/wasm-sdk/rsshogi_nnue_mini.wasm
+      - run: node --check bindings/wasm/mini.js
+      - run: node --check bindings/wasm/worker.js
+      - run: node --test scripts/check_wasm_bindings.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-sdk
+          path: dist/wasm-sdk/
+          if-no-files-found: error

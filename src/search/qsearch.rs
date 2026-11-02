@@ -1,15 +1,18 @@
 //! 静止探索と、その候補生成・SEEに基づく判定を担う。
 
+use crate::position::MoveFacts;
+#[cfg(test)]
+use crate::position::SearchPositionExt;
 use rsshogi::board::{CapturePlusPro, Legal, Move32List, Position, generate_moves_move32};
 use rsshogi::mate::solve_mate_in_one;
-use rsshogi::types::{Move32, Move32Metadata};
+use rsshogi::types::Move32;
 
 use crate::eval::{EvalParams, Evaluator};
 use crate::position::MAX_SEARCH_PLY;
 use crate::tt::{Bound, TtEntry};
 
 use super::context::{SearchContext, tt_key};
-use super::history::CONTINUATION_PLIES;
+use super::history::{CONTINUATION_PLIES, threatened_squares};
 use super::ordering::{MovePicker, OrderedMove, OrderingInputs, is_legal_generated};
 use super::score::{bound_after_search, declaration_score, score_to_tt, terminal_score, tt_cutoff};
 use super::{CaptureSee, MATE, MAX_QPLY, legal_moves};
@@ -23,6 +26,7 @@ pub(super) fn qsearch(
     context: &mut SearchContext,
 ) -> Option<i32> {
     context.enter_node()?;
+    super::stats::bump(super::stats::Stat::QsearchNodes);
     if let Some(score) = terminal_score(position, ply, context.limits.max_moves_to_draw) {
         return Some(score);
     }
@@ -32,11 +36,8 @@ pub(super) fn qsearch(
     if ply >= MAX_SEARCH_PLY {
         return Some(structural_leaf_score(position, ply, &mut context.evaluator));
     }
-    // TTを読み書きするのは静止探索の入口だけ。再帰した先の局面は保存しない。
-    let tt = QsearchTt {
-        key: (qply == 0).then(|| tt_key(position, context.limits.max_moves_to_draw)),
-        ply,
-    };
+    // 静止探索の全nodeでTTを読み書きする。
+    let tt = QsearchTt { key: Some(tt_key(position, context.limits.max_moves_to_draw)), ply };
     // 深いentryほど信頼できるので、depthによるprobeの制限は設けない。
     // 保存側はdepth 0のままなので、主探索のentryを上書きすることはない。
     let tt_entry = tt.key.and_then(|key| context.table.probe(key));
@@ -48,9 +49,28 @@ pub(super) fn qsearch(
     }
     let search_alpha = alpha;
     let in_check = position.is_in_check();
+    // TTへ書き戻すのは生の値、stand patとdelta刈りに使うのは補正後の値。
+    // stand patでβを超えるnodeでは、1手詰めも手の生成も払わずに返す。
+    // 王手されていない局面で合法手が一つも無いことは実戦ではまず起きないので、
+    // その判定は手を読むnodeでだけ行う。
+    let (raw_stand_pat, stand_pat) = if in_check {
+        (None, None)
+    } else {
+        // TT entryに静的評価が残っていれば、高価な再評価を省いてそれを使う。
+        let raw = tt_entry
+            .and_then(|entry| entry.static_eval)
+            .unwrap_or_else(|| context.evaluator.evaluate(position));
+        let stand_pat = context.corrected_eval(position, raw);
+        if stand_pat >= beta {
+            tt.store(context, stand_pat, Bound::Lower, None, Some(raw));
+            return Some(stand_pat);
+        }
+        alpha = alpha.max(stand_pat);
+        (Some(raw), Some(stand_pat))
+    };
     if !in_check && let Some(mate_move) = solve_mate_in_one(position) {
         let score = MATE - ply as i32 - 1;
-        tt.store(context, score, Bound::Exact, Some(mate_move), None);
+        tt.store(context, score, Bound::Exact, Some(mate_move), raw_stand_pat);
         return Some(score);
     }
     // 王手されていなければ、静止探索が見るのは捕獲と歩の成りだけなので、
@@ -68,22 +88,6 @@ pub(super) fn qsearch(
         tt.store(context, score, Bound::Exact, None, None);
         return Some(score);
     }
-    // TTへ書き戻すのは生の値、stand patとdelta刈りに使うのは補正後の値。
-    let (raw_stand_pat, stand_pat) = if in_check {
-        (None, None)
-    } else {
-        // TT entryに静的評価が残っていれば、高価な再評価を省いてそれを使う。
-        let raw = tt_entry
-            .and_then(|entry| entry.static_eval)
-            .unwrap_or_else(|| context.evaluator.evaluate(position));
-        let stand_pat = context.corrected_eval(position, raw);
-        if stand_pat >= beta {
-            tt.store(context, stand_pat, Bound::Lower, None, Some(raw));
-            return Some(stand_pat);
-        }
-        alpha = alpha.max(stand_pat);
-        (Some(raw), Some(stand_pat))
-    };
     if (qply >= MAX_QPLY && !in_check) || moves.is_empty() {
         tt.store(context, alpha, bound_after_search(alpha, search_alpha), None, raw_stand_pat);
         return Some(alpha);
@@ -93,8 +97,14 @@ pub(super) fn qsearch(
         eval_params: context.evaluator.params(),
         search_params: context.params,
         killers: [None; 2],
-        // qsearchは静かな手を並べないのでcontinuationは引かない。
+        // continuationは引かない。静かな王手回避のmain historyは実際の脅威で引く。
         previous: [None; CONTINUATION_PLIES],
+        in_check,
+        threats: if in_check {
+            threatened_squares(position)
+        } else {
+            rsshogi::types::Bitboard::EMPTY
+        },
     };
     let mut picker =
         MovePicker::new(position, moves, tt_move, inputs, &context.history, ordering_buffer);
@@ -125,6 +135,7 @@ pub(super) fn qsearch(
             continue;
         }
         position.apply_move32(mv);
+        context.table.prefetch(tt_key(position, context.limits.max_moves_to_draw));
         context.evaluator.advance(position, mv);
         let child = qsearch(position, -beta, -alpha, ply + 1, qply + 1, context).map(|v| -v);
         position.undo_move32(mv).expect("a searched move must be undoable");
@@ -174,6 +185,7 @@ impl QsearchTt {
                 bound,
                 best_move,
                 static_eval,
+                pv: false,
             });
         }
     }
@@ -187,7 +199,7 @@ pub(super) fn structural_leaf_score(
     if legal_moves(position).is_empty() { -MATE + ply as i32 } else { evaluator.evaluate(position) }
 }
 
-fn immediate_material_gain(metadata: Move32Metadata, params: EvalParams) -> i32 {
+fn immediate_material_gain(metadata: MoveFacts, params: EvalParams) -> i32 {
     let captured = metadata.captured_piece_type();
     params.piece_value(captured)
         + params.piece_value(captured.demote())
@@ -210,7 +222,7 @@ fn qsearch_candidates(position: &Position, out: &mut Move32List) {
 }
 
 fn should_prune_qsearch_capture_by_see(
-    metadata: Move32Metadata,
+    metadata: MoveFacts,
     tactical_exclusion: bool,
     see: CaptureSee,
     margin: i32,
@@ -224,7 +236,7 @@ fn should_prune_qsearch_capture_by_see(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     use rsshogi::board;
 
@@ -264,6 +276,7 @@ mod tests {
                     bound: Bound::Upper,
                     best_move: None,
                     static_eval: Some(raw),
+                    pv: false,
                 };
                 context.table.store(seed);
                 let beta = if sign > 0 { 0 } else { INF };
@@ -281,8 +294,9 @@ mod tests {
                 context.table.store(seed);
                 // Reverse futility returns the corrected static evaluation directly.
                 let beta = raw - 200;
-                let score = negamax(&mut position, 1, beta - 1, beta, 1, [None; 2], &mut context)
-                    .expect("main search completes");
+                let score =
+                    negamax(&mut position, 1, beta - 1, beta, 1, [None; 2], false, &mut context)
+                        .expect("main search completes");
                 assert_eq!(score, raw);
                 assert_eq!(mate_distance(score), None);
             }
@@ -297,13 +311,13 @@ mod tests {
         let profitable = board::move_from_usi(&position, "2e2d").expect("legal profitable capture");
 
         assert!(should_prune_qsearch_capture_by_see(
-            position.move32_metadata(losing),
+            position.move_facts(losing),
             false,
             static_exchange_eval(&position, losing, EvalParams::default()),
             0,
         ));
         assert!(!should_prune_qsearch_capture_by_see(
-            position.move32_metadata(profitable),
+            position.move_facts(profitable),
             false,
             static_exchange_eval(&position, profitable, EvalParams::default()),
             0,
@@ -313,7 +327,7 @@ mod tests {
         let quiet_promotion =
             board::move_from_usi(&promotion_position, "5c5b+").expect("legal quiet promotion");
         assert!(!should_prune_qsearch_capture_by_see(
-            promotion_position.move32_metadata(quiet_promotion),
+            promotion_position.move_facts(quiet_promotion),
             false,
             None,
             0,
@@ -329,7 +343,7 @@ mod tests {
         assert!(position.gives_check_move32(losing_check));
 
         assert!(!should_prune_qsearch_capture_by_see(
-            position.move32_metadata(losing_check),
+            position.move_facts(losing_check),
             true,
             static_exchange_eval(&position, losing_check, EvalParams::default()),
             0,
@@ -343,10 +357,7 @@ mod tests {
         let rook_capture =
             board::move_from_usi(&rook_position, "5e5d").expect("legal rook capture");
         assert_eq!(
-            immediate_material_gain(
-                rook_position.move32_metadata(rook_capture),
-                EvalParams::default()
-            ),
+            immediate_material_gain(rook_position.move_facts(rook_capture), EvalParams::default()),
             2_000
         );
 
@@ -356,7 +367,7 @@ mod tests {
             board::move_from_usi(&promoted_position, "5e5d").expect("legal promoted capture");
         assert_eq!(
             immediate_material_gain(
-                promoted_position.move32_metadata(promoted_capture),
+                promoted_position.move_facts(promoted_capture),
                 EvalParams::default()
             ),
             550
@@ -391,13 +402,42 @@ mod tests {
     }
 
     #[test]
+    fn qsearch_orders_quiet_evasions_by_the_actual_threat_history() {
+        let mut position = board::position_from_sfen("4k4/9/9/9/9/9/9/9/4R3K w - 1")
+            .expect("valid checked position");
+        let threats = threatened_squares(&position);
+        let moves = legal_moves(&position);
+        let preferred = *moves.last().expect("king can evade");
+        assert!(super::super::ordering::is_quiet(position.move_facts(preferred)));
+        let mut context = test_context(Arc::new(AtomicU64::new(0)), Some(2));
+        context.history.record_quiet_cutoff(position.turn(), preferred, &[], 16, threats);
+        assert!(context.history.quiet_score(position.turn(), preferred, threats) > 0);
+        assert_eq!(
+            context.history.quiet_score(
+                position.turn(),
+                preferred,
+                rsshogi::types::Bitboard::EMPTY
+            ),
+            0
+        );
+        position.apply_move32(preferred);
+        let child_key = tt_key(&position, 0);
+        position.undo_move32(preferred).expect("undo preferred evasion");
+        let original = position.to_sfen(None);
+        // 入口と最初の回避の子だけを受理し、どの手を最初に読んだかをTTで確かめる。
+        assert!(qsearch(&mut position, -INF, INF, 0, 0, &mut context).is_none());
+        assert!(context.table.probe(child_key).is_some(), "trained evasion searched first");
+        assert_eq!(position.to_sfen(None), original, "stopped search restores the position");
+    }
+
+    #[test]
     fn structural_ply_limit_stops_qsearch_after_one_bounded_leaf() {
         let mut position = board::hirate_position();
         let nodes = Arc::new(AtomicU64::new(0));
         let mut context = test_context(Arc::clone(&nodes), None);
 
         assert_eq!(qsearch(&mut position, -INF, INF, MAX_SEARCH_PLY, 0, &mut context), Some(0));
-        assert_eq!(nodes.load(Ordering::Relaxed), 1);
+        assert_eq!(context.node_count(), 1);
     }
 
     #[test]
@@ -411,6 +451,7 @@ mod tests {
             bound: Bound::Exact,
             best_move: None,
             static_eval: None,
+            pv: false,
         });
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
         context.table = table;
@@ -419,8 +460,8 @@ mod tests {
         assert_eq!(context.node_count(), 1);
         assert_eq!(
             qsearch(&mut position, -INF, INF, 0, 1, &mut context),
-            Some(0),
-            "a recursive qsearch node must not reuse a root-qsearch horizon entry"
+            Some(123),
+            "recursive qsearch nodes also reuse the entry"
         );
     }
 
@@ -435,6 +476,7 @@ mod tests {
             bound: Bound::Exact,
             best_move: None,
             static_eval: None,
+            pv: false,
         };
         table.store(main_entry);
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
@@ -465,6 +507,7 @@ mod tests {
             bound: Bound::Upper,
             best_move: None,
             static_eval: Some(777),
+            pv: false,
         });
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
         context.table = table;
@@ -510,7 +553,7 @@ mod tests {
         )
         .expect("valid mate position");
         let mate_move = solve_mate_in_one(&position).expect("mate in one");
-        let metadata = position.move32_metadata(mate_move);
+        let metadata = position.move_facts(mate_move);
         assert!(!metadata.is_capture() && !metadata.is_promotion());
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
 
@@ -526,7 +569,7 @@ mod tests {
         let quiet_check = legal_moves(&position)
             .into_iter()
             .find(|mv| {
-                let metadata = position.move32_metadata(*mv);
+                let metadata = position.move_facts(*mv);
                 position.gives_check_move32(*mv)
                     && !metadata.is_capture()
                     && !metadata.is_promotion()
@@ -559,7 +602,7 @@ mod tests {
             let mut expected = super::super::search_moves(&position)
                 .into_iter()
                 .filter(|mv| {
-                    let metadata = position.move32_metadata(*mv);
+                    let metadata = position.move_facts(*mv);
                     metadata.is_capture()
                         || (metadata.is_promotion()
                             && position.moved_piece_before(*mv).piece_type()

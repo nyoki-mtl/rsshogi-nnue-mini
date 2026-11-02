@@ -95,13 +95,17 @@ pub(super) fn search_root(
     context: &mut SearchContext,
 ) -> Option<RootOutcome> {
     let original_alpha = alpha;
+    context.reset_cutoffs(1);
+    context.reset_cutoffs(2);
     let mut best_move = moves[0];
     let key = tt_key(position, context.limits.max_moves_to_draw);
     if let Some(tt_move) = context.table.probe(key).and_then(|entry| entry.best_move)
         && let Some(index) = moves.iter().position(|mv| *mv == tt_move)
     {
-        moves.swap(0, index);
+        moves[..=index].rotate_right(1);
     }
+    // 各手の部分木に費やしたnode数。iterationを読み終えたら次のiterationの順序に使う。
+    let mut effort = vec![0u64; moves.len()];
 
     let partial = |alpha: i32, best_move: Move32| {
         (alpha > original_alpha).then_some(RootOutcome { best_move, score: alpha, complete: false })
@@ -111,25 +115,35 @@ pub(super) fn search_root(
         if context.should_stop() {
             return partial(alpha, best_move);
         }
+        let nodes_before = context.local_node_count();
         position.apply_move32(mv);
+        context.table.prefetch(tt_key(position, context.limits.max_moves_to_draw));
         context.evaluator.advance(position, mv);
         let child_depth = depth.saturating_sub(1);
         let child = if index == 0 {
-            search_child(position, child_depth, alpha, beta, 1, [None; 2], context)
+            search_child(position, child_depth, alpha, beta, 1, [None; 2], false, context)
         } else {
-            match search_child(position, child_depth, alpha, alpha + 1, 1, [None; 2], context) {
+            match search_child(position, child_depth, alpha, alpha + 1, 1, [None; 2], true, context)
+            {
                 Some(score) if score > alpha && score < beta => {
-                    search_child(position, child_depth, alpha, beta, 1, [None; 2], context)
+                    search_child(position, child_depth, alpha, beta, 1, [None; 2], false, context)
                 }
                 other => other,
             }
         };
         position.undo_move32(mv).expect("a searched move must be undoable");
         context.evaluator.undo();
+        effort[index] = context.local_node_count().saturating_sub(nodes_before);
         let Some(score) = child else {
             return partial(alpha, best_move);
         };
 
+        if score > alpha && index > 0 {
+            super::stats::bump(super::stats::Stat::RootBestChanged);
+            if index >= 3 {
+                super::stats::bump(super::stats::Stat::RootBestFromLate);
+            }
+        }
         if score > alpha {
             alpha = score;
             best_move = mv;
@@ -142,11 +156,13 @@ pub(super) fn search_root(
                 bound: Bound::Lower,
                 best_move: Some(best_move),
                 static_eval: None,
+                pv: true,
             });
             return Some(RootOutcome { best_move, score, complete: true });
         }
     }
 
+    order_root_moves(moves, &effort, best_move);
     context.table.store(TtEntry {
         key,
         depth,
@@ -154,14 +170,27 @@ pub(super) fn search_root(
         bound: if alpha > original_alpha { Bound::Exact } else { Bound::Upper },
         best_move: Some(best_move),
         static_eval: None,
+        pv: true,
     });
     Some(RootOutcome { best_move, score: alpha, complete: true })
+}
+
+/// 読み終えたiterationの結果で次のiterationの順序を決める。
+///
+/// 最善手を先頭に置き、残りは部分木に費やしたnode数の多い順に並べる。
+/// 多く読まれた手ほど、最善手を覆しかけた有力な手である。
+fn order_root_moves(moves: &mut [Move32], effort: &[u64], best_move: Move32) {
+    let mut ranked = moves.iter().copied().zip(effort.iter().copied()).collect::<Vec<_>>();
+    ranked.sort_by_key(|&(mv, nodes)| (mv != best_move, std::cmp::Reverse(nodes)));
+    for (slot, (mv, _)) in moves.iter_mut().zip(ranked) {
+        *slot = mv;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
 
     use rsshogi::board;
 
@@ -179,7 +208,7 @@ mod tests {
         let mut context = test_context(Arc::clone(&counted), None);
         context.evaluator.initialize(&position);
         search_root(&mut position, &mut moves, 2, -INF, INF, &mut context).expect("full iteration");
-        let full = counted.load(Ordering::Relaxed);
+        let full = context.node_count();
         assert!(full > 4, "iterationが短すぎて打ち切りを試せない");
 
         let nodes = Arc::new(AtomicU64::new(0));

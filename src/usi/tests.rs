@@ -7,8 +7,6 @@ use std::time::{Duration, Instant};
 
 use rsshogi::board;
 
-#[cfg(not(feature = "tuning"))]
-use crate::nnue::DEFAULT_FV_SCALE;
 use crate::params::SearchParams;
 #[cfg(feature = "tuning")]
 use crate::params::tunable_manifest;
@@ -171,12 +169,12 @@ fn try_rule_is_rejected() {
 #[cfg(feature = "tuning")]
 #[test]
 fn manifest_uses_shogiarena_schema() {
-    let manifest = tunable_manifest(crate::nnue::DEFAULT_FV_SCALE);
+    let manifest = tunable_manifest();
     assert!(manifest.contains("shogiarena.usi_tunables.v1"));
     assert!(manifest.contains("SearchNullMoveEvalDivisor"));
-    assert!(manifest.contains("\"option\":\"FV_SCALE\""));
+    assert!(!manifest.contains("FV_SCALE"));
     assert!(!manifest.contains("EvalPawnValue"));
-    assert_eq!(manifest.matches("\"id\":").count(), 41);
+    assert_eq!(manifest.matches("\"id\":").count(), 51);
 }
 
 #[test]
@@ -196,14 +194,13 @@ fn usi_advertises_runtime_options() {
     assert!(output.contains("option name MoveOverhead type spin default 500 min 0 max 5000"));
     #[cfg(feature = "tuning")]
     {
-        assert!(output.contains("option name SearchAspirationWindow type spin default 83"));
-        assert!(output.contains("option name SearchCheckBonus type spin default 4269"));
-        assert!(output.contains("option name FV_SCALE type spin default 21"));
+        assert!(output.contains("option name SearchAspirationWindow type spin default 88"));
+        assert!(output.contains("option name SearchCheckBonus type spin default 4175"));
         assert!(output.contains("option name Clear Hash type button"));
     }
+    assert!(!output.contains("option name FV_SCALE"));
     #[cfg(not(feature = "tuning"))]
     {
-        assert!(!output.contains("option name FV_SCALE"));
         assert!(!output.contains("option name Clear Hash"));
         assert!(!output.contains("option name SearchAspirationWindow"));
         assert!(!output.contains("option name SearchCheckBonus"));
@@ -231,7 +228,6 @@ fn normal_build_keeps_nnue_and_tuning_values_fixed() {
     }
 
     assert_eq!(engine.eval_file, DEFAULT_EVAL_FILE);
-    assert_eq!(engine.fv_scale, DEFAULT_FV_SCALE);
     assert_eq!(engine.search_params, SearchParams::default());
 }
 
@@ -301,7 +297,7 @@ fn embedded_package_is_the_default_and_can_be_selected_again() {
     engine.material_test_mode = false;
     let mut writer = Vec::new();
     engine.handle_line("isready", &mut writer).expect("embedded package should load");
-    assert!(output(&writer).contains("loaded mobile .rsnn: @default digest="));
+    assert!(output(&writer).contains("loaded A-only .rsnn: @default digest="));
     assert!(output(&writer).lines().any(|line| line == "readyok"));
 
     writer.clear();
@@ -428,6 +424,52 @@ fn worker_runtime_is_reused_across_searches() {
 }
 
 #[test]
+fn worker_threads_survive_go_and_maintenance_and_rebuild_after_threads_change() {
+    let mut engine = Engine::new();
+    let mut writer = Vec::new();
+    engine.handle_line("setoption name Threads value 3", &mut writer).unwrap();
+    engine.handle_line("go depth 2", &mut writer).unwrap();
+    wait_for_idle(&mut engine, &mut writer);
+    let ids = engine.worker.thread_ids();
+    assert_eq!(ids.len(), 3);
+    for command in ["setoption name Clear Hash", "setoption name USI_Hash value 1", "usinewgame"] {
+        engine.handle_line(command, &mut writer).unwrap();
+        engine.handle_line("go depth 2", &mut writer).unwrap();
+        wait_for_idle(&mut engine, &mut writer);
+        assert_eq!(engine.worker.thread_ids(), ids, "{command}");
+    }
+    engine.handle_line("setoption name Threads value 2", &mut writer).unwrap();
+    engine.handle_line("go depth 2", &mut writer).unwrap();
+    wait_for_idle(&mut engine, &mut writer);
+    let next = engine.worker.thread_ids();
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[0], ids[0], "coordinator remains the main worker");
+    assert!(!ids[1..].contains(&next[1]), "helpers are rebuilt after Threads changes");
+    assert_eq!(bestmove_count(&writer), 5);
+}
+
+#[test]
+fn eval_package_change_releases_workers_before_loading_the_next_package() {
+    let mut engine = Engine::new();
+    let mut writer = Vec::new();
+    engine.handle_line("setoption name Threads value 2", &mut writer).unwrap();
+    engine.handle_line("go depth 2", &mut writer).unwrap();
+    wait_for_idle(&mut engine, &mut writer);
+    let old = engine.worker.thread_ids();
+    assert_eq!(old.len(), 2);
+    engine.handle_line("setoption name EvalPackage value next.rsnn", &mut writer).unwrap();
+    assert!(engine.worker.thread_ids().is_empty(), "old contexts must be released before isready");
+    // material_test_modeでpackageのI/Oと切り離し、再構築の境界だけを検証する。
+    engine.handle_line("go depth 2", &mut writer).unwrap();
+    wait_for_idle(&mut engine, &mut writer);
+    let next = engine.worker.thread_ids();
+    assert_eq!(next.len(), 2);
+    assert_eq!(next[0], old[0]);
+    assert_ne!(next[1], old[1]);
+    assert_eq!(bestmove_count(&writer), 2);
+}
+
+#[test]
 fn lazy_smp_publishes_only_the_main_worker_result() {
     let mut engine = Engine::new();
     let mut writer = Vec::new();
@@ -439,6 +481,31 @@ fn lazy_smp_publishes_only_the_main_worker_result() {
 
     assert_eq!(engine.threads, 2);
     assert_eq!(bestmove_count(&writer), 1);
+}
+
+#[test]
+fn search_info_reports_hashfull_including_the_final_result() {
+    let mut engine = Engine::new();
+    let mut writer = Vec::new();
+    engine.handle_line("setoption name USI_Hash value 1", &mut writer).unwrap();
+    engine.handle_line("go nodes 5000", &mut writer).unwrap();
+    wait_for_idle(&mut engine, &mut writer);
+    let text = output(&writer);
+    let reports = text.lines().filter(|line| line.starts_with("info depth")).collect::<Vec<_>>();
+    assert!(!reports.is_empty());
+    let mut observed_usage = false;
+    for line in reports {
+        let words = line.split_whitespace().collect::<Vec<_>>();
+        let index =
+            words.iter().position(|word| *word == "hashfull").expect("hashfull is reported");
+        let value = words[index + 1].parse::<u32>().unwrap();
+        assert!(value <= 1000);
+        observed_usage |= value > 0;
+    }
+    assert!(observed_usage);
+    let lines = text.lines().collect::<Vec<_>>();
+    assert!(lines[lines.len() - 2].contains("hashfull"), "final info precedes bestmove");
+    assert!(lines.last().unwrap().starts_with("bestmove"));
 }
 
 #[test]
@@ -547,7 +614,7 @@ fn final_info_precedes_bestmove_when_no_iteration_completes() {
 #[test]
 fn mate_scores_are_written_as_mate_not_cp() {
     let mut writer = Vec::new();
-    write_info(&mut writer, 4, 31_997, 123, Duration::from_millis(10), &[])
+    write_info(&mut writer, 4, 31_997, 123, Duration::from_millis(10), 0, &[])
         .expect("info should write");
 
     assert!(output(&writer).contains("score mate 3"));
@@ -558,7 +625,7 @@ fn mate_scores_are_written_as_mate_not_cp() {
 fn zero_distance_mate_scores_keep_the_outcome_sign() {
     for (score, expected) in [(32_000, "score mate +"), (-32_000, "score mate -")] {
         let mut writer = Vec::new();
-        write_info(&mut writer, 0, score, 0, Duration::ZERO, &[]).expect("info should write");
+        write_info(&mut writer, 0, score, 0, Duration::ZERO, 0, &[]).expect("info should write");
         assert!(output(&writer).contains(expected));
         assert!(!output(&writer).contains("score mate 0"));
     }

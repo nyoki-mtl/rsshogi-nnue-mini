@@ -3,7 +3,8 @@ name = "rsnn-package"
 version = "0.1.0"
 edition = "2024"
 authors = ["rsshogi-nnue Developers"]
-description = "Host-only canonical contract for portable .rsnn NNUE packages"
+license = "MIT"
+description = "Canonical contract for portable .rsnn NNUE packages"
 publish = false
 
 [dependencies]

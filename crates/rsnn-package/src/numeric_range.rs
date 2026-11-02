@@ -126,16 +126,14 @@ pub fn verify_sfnnv15_numeric_range(
                 ACCUMULATOR_DIMS,
                 THREAT_FEATURES,
             ),
-            "sfnnv15_mobile_v1" => (
-                EvaluationDescriptor::sfnnv15_mobile_v1_schema(),
-                usize::from(schema::BASE_KING_BUCKETS),
-                usize::from(schema::BASE_PLANES),
-                512,
-                0,
-            ),
+            "aonly1024_i8_progress8_v1" => {
+                (EvaluationDescriptor::aonly1024_i8_progress8_v1_schema(), 1, 2344, 1024, 0)
+            }
             recipe
                 if recipe.starts_with("sfnnv15_")
-                    || manifest.evaluation_descriptor.feature_schema.id == "sfnnv15_shogi" =>
+                    || manifest.evaluation_descriptor.feature_schema.id == "sfnnv15_shogi"
+                    || recipe.starts_with("aonly")
+                    || manifest.evaluation_descriptor.feature_schema.id == "aonly_shogi" =>
             {
                 return Err(Error::UnsupportedRecipe(format!(
                     "{}@{}",
@@ -146,6 +144,15 @@ pub fn verify_sfnnv15_numeric_range(
         };
     let expectation = EvaluatorExpectation::new(expected)?;
     expectation.verify(&manifest.evaluation_descriptor)?;
+
+    if manifest.evaluation_descriptor.recipe_id == "aonly1024_i8_progress8_v1" {
+        certify_aonly_dense(manifest, payload)?;
+        if tensor_data(manifest, payload, "ft_base_weight")?.contains(&128) {
+            return Err(Error::InvalidDescriptor(
+                "A-only FT requires symmetric I8 (-127..127)".into(),
+            ));
+        }
+    }
 
     let key = CacheKey {
         evaluation_spec_hash: manifest.evaluation_spec_hash,
@@ -188,7 +195,14 @@ pub fn verify_sfnnv15_numeric_range(
     };
 
     let accumulator = certify_accumulator(
-        |row, lane| i128::from(read_i16(base, row * accumulator_dims + lane)),
+        |row, lane| {
+            let index = row * accumulator_dims + lane;
+            if threat_rows == 0 {
+                i128::from(base[index] as i8)
+            } else {
+                i128::from(read_i16(base, index))
+            }
+        },
         |row, lane| i128::from(i8::from_le_bytes([threat[row * accumulator_dims + lane]])),
         |lane| i128::from(read_i16(bias, lane)),
         NumericLayout {
@@ -219,6 +233,33 @@ pub fn verify_sfnnv15_numeric_range(
     Ok(Sfnnv15NumericRangeVerification::Certified(report))
 }
 
+// Every dense input is in 0..=127. Include each partial sum in the bound so
+// the consumer's i32 multiply/add sequence is safe regardless of summation order.
+fn certify_aonly_dense(manifest: &Manifest, payload: &[u8]) -> Result<()> {
+    for (name, inputs, outputs) in [("fc0", 1024, 32), ("fc1", 64, 32), ("fc2", 128, 1)] {
+        let weights = tensor_data(manifest, payload, &format!("{name}_weight"))?;
+        let biases = tensor_data(manifest, payload, &format!("{name}_bias"))?;
+        for row in 0..8 * outputs {
+            let bias = i128::from(read_i32(biases, row));
+            let mut lo = bias;
+            let mut hi = bias;
+            for &w in &weights[row * inputs..(row + 1) * inputs] {
+                let w = i128::from(w as i8) * 127;
+                lo += w.min(0);
+                hi += w.max(0);
+            }
+            require_range(
+                format!("A-only {name} row {row}"),
+                lo,
+                hi,
+                i128::from(i32::MIN),
+                i128::from(i32::MAX),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct NumericLayout {
     base_buckets: usize,
@@ -238,8 +279,10 @@ where
     Threat: Fn(usize, usize) -> i128,
     Bias: Fn(usize) -> i128,
 {
-    let threat_extrema =
-        collect_extrema::<THREAT_MAX_ACTIVE, _>(layout.threat_rows, layout.lanes, &threat);
+    // A-only has no threat rows, so it needs neither top-K storage nor a scan.
+    let threat_extrema = (layout.threat_rows != 0).then(|| {
+        collect_extrema::<THREAT_MAX_ACTIVE, _>(layout.threat_rows, layout.lanes, &threat)
+    });
     let mut overall_min = i128::MAX;
     let mut overall_max = i128::MIN;
     for king_bucket in 0..layout.base_buckets {
@@ -259,8 +302,10 @@ where
                 i128::from(i16::MIN),
                 i128::from(i16::MAX),
             )?;
-            let minimum = base_minimum + threat_extrema[lane].minimum();
-            let maximum = base_maximum + threat_extrema[lane].maximum();
+            let minimum =
+                base_minimum + threat_extrema.as_ref().map_or(0, |extrema| extrema[lane].minimum());
+            let maximum =
+                base_maximum + threat_extrema.as_ref().map_or(0, |extrema| extrema[lane].maximum());
             require_range(
                 format!("combined accumulator king_bucket {king_bucket} channel {lane}"),
                 minimum,
@@ -284,8 +329,10 @@ where
     Base: Fn(usize, usize) -> i128,
     Threat: Fn(usize, usize) -> i128,
 {
-    let threat_extrema =
-        collect_extrema::<THREAT_MAX_ACTIVE, _>(layout.threat_rows, layout.lanes, &threat);
+    // A-only has no threat rows, so it needs neither top-K storage nor a scan.
+    let threat_extrema = (layout.threat_rows != 0).then(|| {
+        collect_extrema::<THREAT_MAX_ACTIVE, _>(layout.threat_rows, layout.lanes, &threat)
+    });
     let mut minima = vec![i128::MAX; layout.lanes];
     let mut maxima = vec![i128::MIN; layout.lanes];
     for king_bucket in 0..layout.base_buckets {
@@ -305,8 +352,10 @@ where
                 i128::from(i32::MIN),
                 i128::from(i32::MAX),
             )?;
-            let minimum = base_minimum + threat_extrema[lane].minimum();
-            let maximum = base_maximum + threat_extrema[lane].maximum();
+            let minimum =
+                base_minimum + threat_extrema.as_ref().map_or(0, |extrema| extrema[lane].minimum());
+            let maximum =
+                base_maximum + threat_extrema.as_ref().map_or(0, |extrema| extrema[lane].maximum());
             require_range(
                 format!("combined PSQT king_bucket {king_bucket} bucket {lane}"),
                 minimum,
@@ -470,16 +519,50 @@ mod tests {
     }
 
     #[test]
-    fn mobile_contract_requires_numeric_range_data_and_exact_shape() {
-        let exact = manifest(EvaluationDescriptor::sfnnv15_mobile_v1_schema());
+    fn aonly_contract_requires_numeric_range_data_and_exact_shape() {
+        let exact = manifest(EvaluationDescriptor::aonly1024_i8_progress8_v1_schema());
         assert!(matches!(
             verify_sfnnv15_numeric_range(&exact, &[]),
             Err(Error::InvalidEntryRange { .. })
         ));
-        let mut wrong = EvaluationDescriptor::sfnnv15_mobile_v1_schema();
-        wrong.tensors[0].shape[1] = 1_024;
+        let mut wrong = EvaluationDescriptor::aonly1024_i8_progress8_v1_schema();
+        wrong.tensors[0].shape[1] = 512;
         assert_eq!(
             verify_sfnnv15_numeric_range(&manifest(wrong), &[]),
+            Err(Error::DescriptorMismatch { field: "tensor_schema" })
+        );
+        let mut old = EvaluationDescriptor::aonly1024_i8_progress8_v1_schema();
+        old.recipe_id = "aonly1024_progress8_v1".into();
+        assert!(matches!(
+            verify_sfnnv15_numeric_range(&manifest(old), &[]),
+            Err(Error::UnsupportedRecipe(_))
+        ));
+    }
+
+    #[test]
+    fn aonly_i8_certificate_sign_extends_weights_and_rejects_minus_128() {
+        let mut m = manifest(EvaluationDescriptor::aonly1024_i8_progress8_v1_schema());
+        let mut payload = vec![0; m.tensors.iter().map(|t| t.length).sum::<u64>() as usize];
+        let base = m.tensors.iter().find(|t| t.name == "ft_base_weight").unwrap().offset as usize;
+        // The conservative certificate may select any 40 distinct rows.
+        for row in 0..40 {
+            payload[base + row * 1024] = (-127_i8) as u8;
+            payload[base + row * 1024 + 1] = 127;
+        }
+        let report = verify_sfnnv15_numeric_range(&m, &payload).unwrap();
+        let Sfnnv15NumericRangeVerification::Certified(report) = report else {
+            panic!("missing I8 certificate");
+        };
+        assert_eq!((report.accumulator_min, report.accumulator_max), (-5080, 5080));
+        // Even a cached successful certificate must not hide an out-of-contract byte.
+        payload[base] = 128;
+        assert!(matches!(
+            verify_sfnnv15_numeric_range(&m, &payload),
+            Err(Error::InvalidDescriptor(_))
+        ));
+        m.evaluation_descriptor.tensors[0].dtype = crate::DType::I16;
+        assert_eq!(
+            verify_sfnnv15_numeric_range(&m, &payload),
             Err(Error::DescriptorMismatch { field: "tensor_schema" })
         );
     }
@@ -493,6 +576,20 @@ mod tests {
             verify_sfnnv15_numeric_range(&manifest(descriptor), &[]).unwrap(),
             Sfnnv15NumericRangeVerification::NotApplicable
         );
+    }
+
+    #[test]
+    fn aonly_dense_overflow_is_rejected() {
+        let m = manifest(EvaluationDescriptor::aonly1024_i8_progress8_v1_schema());
+        let mut payload = vec![0; m.tensors.iter().map(|t| t.length).sum::<u64>() as usize];
+        let weight = m.tensors.iter().find(|t| t.name == "fc0_weight").unwrap().offset as usize;
+        let bias = m.tensors.iter().find(|t| t.name == "fc0_bias").unwrap().offset as usize;
+        payload[weight] = 1;
+        payload[bias..bias + 4].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(matches!(
+            verify_sfnnv15_numeric_range(&m, &payload),
+            Err(Error::NumericRangeViolation { .. })
+        ));
     }
 
     #[test]
@@ -545,6 +642,22 @@ mod tests {
         assert!(
             matches!(error, Error::NumericRangeViolation { context, .. } if context.contains("base accumulator"))
         );
+    }
+
+    #[test]
+    fn no_threat_rows_preserve_signed_bounds_without_reading_threat_weights() {
+        let layout =
+            NumericLayout { base_buckets: 1, base_rows_per_bucket: 2, threat_rows: 0, lanes: 2 };
+        let base = |row, lane| match (row, lane) {
+            (0, 0) => -7,
+            (1, 0) => 11,
+            (0, 1) => -13,
+            (1, 1) => 17,
+            _ => unreachable!(),
+        };
+        let threat = |_, _| panic!("a threat-disabled layout must not read threat weights");
+        assert_eq!(certify_accumulator(base, threat, |_| 3, layout).unwrap(), (-10, 20));
+        assert_eq!(certify_psqt(base, threat, layout).unwrap(), (-13, 17, 30));
     }
 
     #[test]

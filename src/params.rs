@@ -78,51 +78,76 @@ pub struct SearchParams {
     pub qsearch_see_margin: i32,
     /// 王手になる静かな手の縮小を、静かな非王手から減らす段数。
     pub check_lmr_offset: i32,
+    pub lmr_tt_pv: i32,
+    pub lmr_cut_node: i32,
+    pub lmr_tt_capture: i32,
+    pub lmr_child_cutoffs: i32,
+    pub lmr_deeper_margin: i32,
+    pub lmr_shallower_margin: i32,
+    pub lmr_research_bonus: i32,
+    pub hindsight_margin: i32,
+    /// βカットより先に試して失敗した静かな手へのペナルティの、bonusに対する百分率。
+    pub history_malus_percent: i32,
+    /// null moveを試す条件で、静的評価がβをこれだけ上回ることを求める。負なら下回っても試す。
+    pub null_move_eval_margin: i32,
+    /// improvingでないnodeの静かな手へ足す縮小量(1/1024段)。
+    pub lmr_not_improving: i32,
 }
 
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
-            aspiration_window: 83,
-            reverse_futility_margin: 128,
-            futility_margin: 173,
-            null_move_eval_divisor: 199,
-            lmr_divisor: 221,
-            qsearch_delta_margin: 124,
-            check_ordering_bonus: 4269,
-            see_prune_margin: 90,
-            history_prune_margin: 2080,
+            aspiration_window: 88,
+            reverse_futility_margin: 132,
+            futility_margin: 299,
+            null_move_eval_divisor: 296,
+            lmr_divisor: 190,
+            qsearch_delta_margin: 196,
+            check_ordering_bonus: 4175,
+            see_prune_margin: 177,
+            history_prune_margin: 2148,
             drop_lmp_divisor: 2,
-            correction_apply_max: 74,
-            continuation_weight: 226,
+            correction_apply_max: 45,
+            continuation_weight: 229,
             time_soft_permille: 600,
             time_max_ratio_percent: 300,
             time_change_weight_permille: 600,
             time_falling_span: 300,
             time_stability_step_permille: 70,
             iir_min_depth: 2,
-            rfp_max_depth: 9,
-            futility_max_depth: 6,
-            see_prune_max_depth: 7,
-            history_prune_max_depth: 5,
-            lmr_history_divisor: 7983,
-            null_move_base_reduction: 3,
-            null_move_verify_depth: 12,
-            lmp_base: 1,
-            history_bonus_per_depth: 156,
-            history_bonus_offset: 81,
-            history_bonus_max: 1651,
+            rfp_max_depth: 12,
+            futility_max_depth: 7,
+            see_prune_max_depth: 5,
+            history_prune_max_depth: 3,
+            lmr_history_divisor: 7199,
+            null_move_base_reduction: 4,
+            null_move_verify_depth: 16,
+            lmp_base: 4,
+            history_bonus_per_depth: 169,
+            history_bonus_offset: 53,
+            history_bonus_max: 1675,
             probcut_margin: 194,
-            singular_min_depth: 6,
+            singular_min_depth: 5,
             singular_margin: 2,
-            lmr_history_clamp: 1,
+            lmr_history_clamp: 2,
             probcut_min_depth: 4,
             lmr_min_index: 2,
-            bad_capture_lmr_offset: 1,
-            null_move_depth_divisor: 2,
-            rfp_improving_depth: 1,
+            bad_capture_lmr_offset: 3,
+            null_move_depth_divisor: 3,
+            rfp_improving_depth: 0,
             qsearch_see_margin: 1,
             check_lmr_offset: 0,
+            lmr_tt_pv: 943,
+            lmr_cut_node: 1688,
+            lmr_tt_capture: 549,
+            lmr_child_cutoffs: 807,
+            lmr_deeper_margin: 26,
+            lmr_shallower_margin: 10,
+            lmr_research_bonus: 806,
+            hindsight_margin: 162,
+            history_malus_percent: 105,
+            null_move_eval_margin: 5,
+            lmr_not_improving: 945,
         }
     }
 }
@@ -156,7 +181,7 @@ macro_rules! tunable {
 
 #[cfg(feature = "tuning")]
 #[rustfmt::skip]
-const TUNABLES: [Tunable; 40] = [
+const TUNABLES: [Tunable; 51] = [
     //       option, manifest id, field, min, max, c_end
     tunable!("SearchAspirationWindow",      "search_aspiration_window",        aspiration_window,            20,   400,   10),
     tunable!("SearchReverseFutilityMargin", "search_reverse_futility_margin",  reverse_futility_margin,      40,   400,   20),
@@ -198,11 +223,18 @@ const TUNABLES: [Tunable; 40] = [
     tunable!("SearchRfpImprovingDepth",     "rfp_improving_depth",             rfp_improving_depth,          0,    3,     1),
     tunable!("SearchQsearchSeeMargin",      "qsearch_see_margin",              qsearch_see_margin,           0,    300,   20),
     tunable!("SearchCheckLmrOffset",        "check_lmr_offset",                check_lmr_offset,             0,    3,     1),
+    tunable!("SearchLmrTtPv",               "search_lmr_tt_pv",                lmr_tt_pv,                    0,    3072,  128),
+    tunable!("SearchLmrCutNode",            "search_lmr_cut_node",             lmr_cut_node,                 0,    4096,  192),
+    tunable!("SearchLmrTtCapture",          "search_lmr_tt_capture",           lmr_tt_capture,               0,    2048,  128),
+    tunable!("SearchLmrChildCutoffs",       "search_lmr_child_cutoffs",        lmr_child_cutoffs,            0,    3072,  128),
+    tunable!("SearchLmrDeeperMargin",       "search_lmr_deeper_margin",        lmr_deeper_margin,            0,    300,   10),
+    tunable!("SearchLmrShallowerMargin",    "search_lmr_shallower_margin",     lmr_shallower_margin,         0,    100,   4),
+    tunable!("SearchLmrResearchBonus",      "search_lmr_research_bonus",       lmr_research_bonus,           0,    4000,  150),
+    tunable!("SearchHindsightMargin",       "search_hindsight_margin",         hindsight_margin,             0,    600,   20),
+    tunable!("SearchHistoryMalusPercent",   "search_history_malus_percent",    history_malus_percent,        25,   300,   10),
+    tunable!("SearchNullMoveEvalMargin",    "search_null_move_eval_margin",    null_move_eval_margin,        -300, 300,   15),
+    tunable!("SearchLmrNotImproving",       "search_lmr_not_improving",        lmr_not_improving,            0,    3072,  128),
 ];
-
-/// `FV_SCALE`の受理範囲。評価器側のoptionだが、manifestでは探索パラメータと並べて出す。
-#[cfg(feature = "tuning")]
-pub const FV_SCALE_RANGE: (i32, i32) = (1, 128);
 
 #[cfg(feature = "tuning")]
 impl SearchParams {
@@ -239,13 +271,12 @@ impl SearchParams {
 
 /// ShogiArenaの`usi_tunables`へ返すmanifest。
 #[cfg(feature = "tuning")]
-pub fn tunable_manifest(fv_scale_default: i32) -> String {
+pub fn tunable_manifest() -> String {
     let entry = |id: &str, option: &str, default: i32, min: i32, max: i32, c_end: i32| {
         format!(
             "{{\"id\":\"{id}\",\"option\":\"{option}\",\"value_type\":\"int\",\"encoding\":\"integer\",\"default\":{default},\"min\":{min},\"max\":{max},\"schedule\":{{\"c_end\":{c_end},\"r_end\":0.002}}}}"
         )
     };
-    let (fv_min, fv_max) = FV_SCALE_RANGE;
     let entries = TUNABLES
         .iter()
         .map(|tunable| {
@@ -258,7 +289,6 @@ pub fn tunable_manifest(fv_scale_default: i32) -> String {
                 tunable.c_end,
             )
         })
-        .chain(std::iter::once(entry("fv_scale", "FV_SCALE", fv_scale_default, fv_min, fv_max, 2)))
         .collect::<Vec<_>>();
     format!(
         "{{\"schema_version\":\"shogiarena.usi_tunables.v1\",\"tunables\":[{}]}}",

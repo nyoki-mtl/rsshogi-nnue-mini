@@ -1,16 +1,16 @@
 //! Pure feature-schema authority for the direct `SFNNv15` shogi contract.
 
+pub const MODEL_FAMILY: &str = "SFNNv15";
 pub const RECIPE_ID: &str = "sfnnv15_v2";
 pub const RECIPE_VERSION: u32 = 2;
 pub const FEATURE_SCHEMA_ID: &str = "sfnnv15_shogi";
 pub const FEATURE_SCHEMA_VERSION: u32 = 2;
 pub const BASE_INDEXING_ID: &str = "halfka_hm_direct_v2";
-/// 一局面で同時に立つbase特徴の上限。盤上の駒38枚と両玉。
-///
-/// 推論側のactive容量であり、numeric rangeの証明もこの上限で行う。
-pub const BASE_MAX_ACTIVE: usize = 40;
 pub const PROGRESS_MAGIC: [u8; 8] = *b"RSKPPRG2";
 pub const PROGRESS_VERSION: u32 = 2;
+pub const PROGRESS_MEDIA_TYPE: &str = "application/vnd.rsshogi.kp-progress-v2";
+pub const PROGRESS_SELECTOR_ID: &str = "kp_absolute_progress_q16_v2";
+pub const TRAINER_ARTIFACT_CONTRACT_VERSION: u32 = 2;
 
 /// Maximum legal unary hand slots by [`HandFeatureKind`].
 pub const HAND_MAX: [u8; 7] = [18, 4, 4, 4, 4, 2, 2];
@@ -25,6 +25,8 @@ pub const BASE_PLANES: u16 = 1_615;
 pub const BASE_KING_BUCKETS: u16 = 45;
 const BASE_KING_BUCKETS_U8: u8 = 45;
 pub const BASE_INPUTS: u32 = 72_675;
+/// Maximum legal active base features, including both kings.
+pub const BASE_MAX_ACTIVE: usize = 40;
 pub const PROGRESS_PLANES: u16 = 1_534;
 pub const PROGRESS_KING_BUCKETS: u16 = 81;
 pub const PROGRESS_INPUTS: u32 = 124_254;
@@ -259,6 +261,21 @@ impl BaseFeatureDelta {
     #[must_use]
     pub const fn two(first: [SemanticAtom; 2], second: [SemanticAtom; 2]) -> Self {
         Self { transitions: [first, second], len: 2 }
+    }
+
+    #[must_use]
+    pub const fn new(transitions: [[SemanticAtom; 2]; 2], len: u8) -> Option<Self> {
+        if len > 2 { None } else { Some(Self { transitions, len }) }
+    }
+
+    #[must_use]
+    pub const fn len(self) -> u8 {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
     }
 
     #[must_use]

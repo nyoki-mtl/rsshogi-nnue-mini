@@ -3,7 +3,7 @@
 
 use std::arch::aarch64::*;
 
-use super::{Column, DENSE_OUTPUTS, WIDTH};
+use super::{Column, CompactColumn, DENSE_OUTPUTS, WIDTH};
 
 const LANES: usize = 8;
 
@@ -23,20 +23,38 @@ fn store(column: &mut Column, offset: usize, value: int16x8_t) {
     unsafe { vst1q_s16(column.0.as_mut_ptr().add(offset), value) }
 }
 
-pub(crate) fn update(dst: &mut Column, src: &Column, removed: &[&Column], added: &[&Column]) {
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_weight(column: &CompactColumn, offset: usize) -> int16x8_t {
+    debug_assert!(offset + LANES <= WIDTH);
+    // SAFETY: eight I8 lanes stay within this column.
+    unsafe { vmovl_s8(vld1_s8(column.0.as_ptr().add(offset))) }
+}
+
+pub(crate) fn update(
+    dst: &mut Column,
+    src: &Column,
+    removed: &[&CompactColumn],
+    added: &[&CompactColumn],
+) {
     // SAFETY: this module is compiled only for builds that enable NEON.
     unsafe { update_neon(dst, src, removed, added) }
 }
 
 #[target_feature(enable = "neon")]
-fn update_neon(dst: &mut Column, src: &Column, removed: &[&Column], added: &[&Column]) {
+fn update_neon(
+    dst: &mut Column,
+    src: &Column,
+    removed: &[&CompactColumn],
+    added: &[&CompactColumn],
+) {
     for offset in (0..WIDTH).step_by(LANES) {
         let mut value = load(src, offset);
         for column in removed {
-            value = vsubq_s16(value, load(column, offset));
+            value = vsubq_s16(value, load_weight(column, offset));
         }
         for column in added {
-            value = vaddq_s16(value, load(column, offset));
+            value = vaddq_s16(value, load_weight(column, offset));
         }
         store(dst, offset, value);
     }
@@ -62,7 +80,7 @@ fn pool_neon(accumulators: [&Column; 2], output: &mut [u8; WIDTH]) {
                 vmovn_u16(vshrq_n_u16::<9>(vmulq_u16(left, right)))
             };
             let packed = vcombine_u8(product(offset), product(offset + LANES));
-            // SAFETY: 16 bytes at `half * 256 + offset` stay inside the 512-byte output.
+            // SAFETY: 16 bytes at `half * WIDTH / 2 + offset` stay inside the WIDTH-byte output.
             unsafe { vst1q_u8(output.as_mut_ptr().add(half * WIDTH / 2 + offset), packed) };
         }
     }

@@ -10,30 +10,37 @@ mod pruning;
 mod qsearch;
 mod root;
 mod score;
+mod stats;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod timing;
+mod workers;
 
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc::Sender};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rsshogi::board::{Move32List, Position, generate_legal_all_move32};
 use rsshogi::types::{MOVE_WIN, Move32};
 
+use crate::clock::Instant;
 use crate::eval::Evaluator;
 use crate::nnue::MAX_NNUE_EVAL;
 use crate::params::SearchParams;
-use crate::position::{MAX_SEARCH_DEPTH, validate_evaluable_position};
+#[cfg(test)]
+use crate::position::MAX_SEARCH_DEPTH;
+#[cfg(test)]
 use crate::tt::TranspositionTable;
 
-use context::{SearchContext, SharedSearch};
+use context::SearchContext;
 pub(crate) use history::HistoryTables;
 use root::{collect_pv, fallback_root_choice, search_root};
 use score::root_terminal_score;
 use timing::IterationTiming;
+pub(crate) use workers::SearchWorkers;
 
 pub use deadline::SearchDeadline;
 pub(crate) use score::mate_distance;
@@ -48,6 +55,12 @@ const MAX_PV_LENGTH: usize = 32;
 /// 前のiterationの評価値を中心とした初期のaspiration窓。
 fn aspiration_window(center: i32, delta: i32) -> (i32, i32) {
     (center.saturating_sub(delta).max(-INF), center.saturating_add(delta).min(INF))
+}
+
+/// 評価の変動が大きいiterationは初期窓を広げ、幅を既存値の1〜3倍に収める。
+fn adaptive_aspiration_delta(base: i32, score_change: i32) -> i32 {
+    let base = base.max(1);
+    base.saturating_add(score_change.clamp(0, base.saturating_mul(2))).min(INF)
 }
 
 /// 窓を外した側だけを、外れた値から`delta`離れた位置まで広げる。
@@ -81,6 +94,7 @@ pub struct SearchIteration {
     pub score: i32,
     pub nodes: u64,
     pub elapsed: Duration,
+    pub hashfull: u32,
     /// rootからの読み筋。先頭は必ずそのiterationの最善手。
     pub pv: Vec<Move32>,
 }
@@ -93,6 +107,7 @@ pub struct SearchResult {
     pub depth: u32,
     pub nodes: u64,
     pub elapsed: Duration,
+    pub hashfull: u32,
     /// rootからの読み筋。`best_move`がないときは空。
     pub pv: Vec<Move32>,
 }
@@ -107,6 +122,7 @@ impl SearchResult {
             depth: 0,
             nodes: 0,
             elapsed,
+            hashfull: 0,
             pv: Vec::new(),
         }
     }
@@ -181,109 +197,19 @@ struct MainWorker<'a> {
     helpers_start: &'a AtomicBool,
 }
 
-/// `histories`はworker slotごとの履歴テーブルで、呼び出し側が`go`をまたいで保持する。
-/// worker数と長さが合わなければ作り直し、探索開始時に全slotを半減(aging)する。
-/// panicで終わった探索は履歴を返さず、次の`go`がゼロから作り直す。
+/// 単発探索のテスト用adapter。USI sessionでは常駐SearchWorkersを使う。
+#[cfg(test)]
 pub fn run(job: SearchJob, table: Arc<TranspositionTable>, histories: &mut Vec<HistoryTables>) {
-    let SearchJob { position, evaluator, params, mut limits, control, events, threads } = job;
-    let start = Instant::now();
-    if validate_evaluable_position(&position).is_err() {
-        let _ = events.send(SearchEvent::Done(SearchResult::fail_closed(start.elapsed())));
-        return;
-    }
-    limits.max_depth = limits.max_depth.clamp(1, MAX_SEARCH_DEPTH);
-    limits.max_nodes = limits.max_nodes.map(|nodes| nodes.max(1));
-    table.new_search();
-    // 履歴は`go`をまたいで持続する。worker数が変わったら作り直し、
-    // 新しい探索の開始時に全slotを半減して古い傾向の重みを下げる。
-    let worker_count = threads.max(1);
-    if histories.len() != worker_count {
-        *histories = std::iter::repeat_with(HistoryTables::new).take(worker_count).collect();
-    }
-    for history in histories.iter_mut() {
-        history.age();
-        history.configure(&params);
-    }
-    let mut history_slots = std::mem::take(histories);
-    let helper_histories = history_slots.drain(1..).collect::<Vec<_>>();
-    let main_history = history_slots.pop().expect("worker 0 always has a history slot");
-    let shared = SharedSearch {
-        cancel: control.cancel,
-        pondering: control.pondering,
-        // Reserve the first node for the reporting worker's evaluated root fallback.
-        nodes: Arc::new(AtomicU64::new(1)),
-        table,
-    };
-    let helpers_start = Arc::new(AtomicBool::new(false));
-    let mut helpers = Vec::new();
-    for (worker_id, helper_history) in (1..worker_count).zip(helper_histories) {
-        let helper_position = position.clone();
-        let helper_context = SearchContext::new(
-            evaluator.clone(),
-            params,
-            limits.clone(),
-            shared.clone(),
-            helper_history,
-        );
-        let helper_start = Arc::clone(&helpers_start);
-        #[cfg(test)]
-        let panic_helper_worker = control.panic_helper_worker;
-        let helper_work = move || {
-            wait_for_helper_start(&helper_start, &helper_context.cancel);
-            #[cfg(test)]
-            assert_ne!(panic_helper_worker, Some(worker_id), "injected helper search panic");
-            search_worker(helper_position, helper_context, worker_id, None).1
-        };
-        #[cfg(test)]
-        let spawn_result = if control.fail_helper_spawn_at == Some(worker_id) {
-            Err(std::io::Error::other("injected helper spawn failure"))
-        } else {
-            thread::Builder::new().spawn(helper_work)
-        };
-        #[cfg(not(test))]
-        let spawn_result = thread::Builder::new().spawn(helper_work);
-        match spawn_result {
-            Ok(helper) => helpers.push(helper),
-            Err(error) => {
-                shared.cancel.store(true, Ordering::Relaxed);
-                for helper in helpers {
-                    let _ = helper.join();
-                }
-                panic!("failed to spawn search helper {worker_id}: {error}");
-            }
-        }
-    }
+    workers::run(job, table, histories);
+}
 
-    let main_context = SearchContext::new(evaluator, params, limits, shared.clone(), main_history);
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        #[cfg(test)]
-        assert!(!control.panic_after_helpers_spawned, "injected main search worker panic");
-        let main = MainWorker { events: &events, helpers_start: &helpers_start };
-        search_worker(position, main_context, 0, Some(main))
-    }));
-    shared.cancel.store(true, Ordering::Relaxed);
-    let mut helper_panic = None;
-    let mut returned_helper_histories = Vec::with_capacity(worker_count.saturating_sub(1));
-    for helper in helpers {
-        match helper.join() {
-            Ok(helper_history) => returned_helper_histories.push(helper_history),
-            Err(payload) => {
-                if helper_panic.is_none() {
-                    helper_panic = Some(payload);
-                }
-            }
-        }
-    }
-    match result {
-        Err(payload) => resume_unwind(payload),
-        Ok(_) if let Some(payload) = helper_panic => resume_unwind(payload),
-        Ok((mut result, main_history)) => {
-            histories.push(main_history);
-            histories.append(&mut returned_helper_histories);
-            result.nodes = shared.nodes.load(Ordering::Relaxed);
-            let _ = events.send(SearchEvent::Done(result));
-        }
-    }
+/// helperがこのdepthのiterationを飛ばすか。
+///
+/// 全workerが同じdepthを同じ順で読むと、共有TTを同じ局面で埋め合うだけで探索が広がらない。
+/// helperごとに飛ばすdepthをずらし、mainより先の深さの結果をTTへ早く置かせる。
+/// mainは飛ばさない。浅いdepthはTT moveと履歴の土台なので全workerが読む。
+fn helper_skips_depth(worker_id: usize, depth: u32) -> bool {
+    worker_id > 0 && depth >= 3 && (depth as usize + worker_id).is_multiple_of(3)
 }
 
 fn wait_for_helper_start(start: &AtomicBool, cancel: &AtomicBool) {
@@ -301,7 +227,7 @@ fn search_worker(
     mut context: SearchContext,
     worker_id: usize,
     main: Option<MainWorker<'_>>,
-) -> (SearchResult, HistoryTables) {
+) -> (SearchResult, SearchContext) {
     let start = Instant::now();
     let root_terminal = root_terminal_score(&position, context.limits.max_moves_to_draw);
     let declaration_move = position.declaration_win_move();
@@ -331,9 +257,11 @@ fn search_worker(
             depth: 0,
             nodes: context.node_count(),
             elapsed: start.elapsed(),
+            hashfull: 0,
             pv,
         };
-        return (result, context.history);
+        context.flush_nodes();
+        return (result, context);
     }
 
     let rotation = worker_id % root_moves.len();
@@ -347,6 +275,7 @@ fn search_worker(
     let mut completed_depth = 0;
     let mut best_move = fallback_move;
     let mut best_score = fallback_score;
+    let mut aspiration_change = 0;
     let mut timing = IterationTiming::new(&context.params);
     let mut time_scale = 1.0;
 
@@ -360,12 +289,16 @@ fn search_worker(
         if depth > 1 && main.is_some() && context.should_skip_new_iteration(time_scale) {
             break;
         }
+        if helper_skips_depth(worker_id, depth) {
+            continue;
+        }
         if let Some(index) = root_moves.iter().position(|mv| *mv == best_move) {
-            root_moves.swap(0, index);
+            root_moves[..=index].rotate_right(1);
         }
 
         // 完了した探索がaspiration窓を外れたら、外れた側だけを広げて同じdepthを引き直す。
-        let mut delta = context.params.aspiration_window.max(1);
+        let mut delta =
+            adaptive_aspiration_delta(context.params.aspiration_window, aspiration_change);
         let (mut window_alpha, mut window_beta) =
             if depth >= 2 { aspiration_window(best_score, delta) } else { (-INF, INF) };
         let outcome = loop {
@@ -391,11 +324,15 @@ fn search_worker(
             delta = delta.saturating_mul(2);
             (window_alpha, window_beta) =
                 widen_aspiration_window(window_alpha, window_beta, outcome.score, delta);
+            if main.is_some() {
+                stats::bump(stats::Stat::AspirationFail);
+            }
         };
         let Some(outcome) = outcome else {
             break;
         };
 
+        let previous_score = best_score;
         best_move = outcome.best_move;
         best_score = outcome.score;
         // 打ち切られたiterationでも、alphaを更新できた手はその窓で前の最善手を上回っている。
@@ -403,7 +340,13 @@ fn search_worker(
         if !outcome.complete {
             break;
         }
+        if completed_depth > 0 {
+            aspiration_change = (aspiration_change + (best_score - previous_score).abs()) / 2;
+        }
         completed_depth = depth;
+        if main.is_some() {
+            stats::bump(stats::Stat::RootIterations);
+        }
         time_scale = timing.record(best_move, best_score, root_moves.len());
         if let Some(main) = &main {
             if depth == 1 {
@@ -414,6 +357,7 @@ fn search_worker(
                 score: best_score,
                 nodes: context.node_count(),
                 elapsed: start.elapsed(),
+                hashfull: context.table.hashfull(),
                 pv: collect_pv(&mut position, best_move, &context),
             }));
         }
@@ -427,9 +371,11 @@ fn search_worker(
         depth: completed_depth,
         nodes: context.node_count(),
         elapsed: start.elapsed(),
+        hashfull: 0,
         pv,
     };
-    (result, context.history)
+    context.flush_nodes();
+    (result, context)
 }
 
 fn legal_moves(position: &Position) -> Vec<Move32> {
@@ -454,10 +400,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn helpers_skip_different_depths_and_the_main_worker_skips_none() {
+        for depth in 1..20 {
+            assert!(!helper_skips_depth(0, depth));
+        }
+        let skipped =
+            |worker| (3..12).filter(|&depth| helper_skips_depth(worker, depth)).collect::<Vec<_>>();
+        assert_ne!(skipped(1), skipped(2));
+        assert!(!skipped(1).is_empty());
+        assert!((1..3).all(|depth| !helper_skips_depth(1, depth)), "浅いdepthは飛ばさない");
+    }
+
+    #[test]
     fn the_initial_aspiration_window_brackets_the_previous_score() {
         assert_eq!(aspiration_window(120, 25), (95, 145));
         assert_eq!(aspiration_window(-INF, 25), (-INF, -INF + 25));
         assert_eq!(aspiration_window(INF, 25), (INF - 25, INF));
+    }
+
+    #[test]
+    fn adaptive_aspiration_stays_bounded_and_widens_for_unstable_scores() {
+        assert_eq!(adaptive_aspiration_delta(25, 0), 25);
+        assert_eq!(adaptive_aspiration_delta(25, 10), 35);
+        assert_eq!(adaptive_aspiration_delta(25, 50), 75);
+        assert_eq!(adaptive_aspiration_delta(25, MATE * 2), 75);
+        assert_eq!(adaptive_aspiration_delta(0, 0), 1);
+        assert_eq!(adaptive_aspiration_delta(INF, MATE * 2), INF);
     }
 
     #[test]
@@ -707,13 +675,13 @@ mod tests {
         run_depth_one(&mut histories, 1);
         assert_eq!(histories.len(), 1, "runがworker slot分の履歴を作って返す");
 
-        histories[0].record_quiet_cutoff(stm, mv, &[], 4);
-        let before = histories[0].quiet_score(stm, mv);
+        histories[0].record_quiet_cutoff(stm, mv, &[], 4, rsshogi::types::Bitboard::EMPTY);
+        let before = histories[0].quiet_score(stm, mv, rsshogi::types::Bitboard::EMPTY);
         assert!(before > 0);
 
         run_depth_one(&mut histories, 1);
         assert_eq!(
-            histories[0].quiet_score(stm, mv),
+            histories[0].quiet_score(stm, mv, rsshogi::types::Bitboard::EMPTY),
             before / 2,
             "2回目のgoで前回の履歴が半減されて残る"
         );
@@ -728,14 +696,14 @@ mod tests {
         let mut histories = Vec::new();
 
         run_depth_one(&mut histories, 1);
-        histories[0].record_quiet_cutoff(stm, mv, &[], 4);
-        assert!(histories[0].quiet_score(stm, mv) > 0);
+        histories[0].record_quiet_cutoff(stm, mv, &[], 4, rsshogi::types::Bitboard::EMPTY);
+        assert!(histories[0].quiet_score(stm, mv, rsshogi::types::Bitboard::EMPTY) > 0);
 
         // usinewgameはUSIセッション側がVecをclearする。次のgoはゼロから作り直す。
         histories.clear();
         run_depth_one(&mut histories, 1);
         assert_eq!(histories.len(), 1);
-        assert_eq!(histories[0].quiet_score(stm, mv), 0);
+        assert_eq!(histories[0].quiet_score(stm, mv, rsshogi::types::Bitboard::EMPTY), 0);
     }
 
     #[test]

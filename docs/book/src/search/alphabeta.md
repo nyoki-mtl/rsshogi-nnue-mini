@@ -72,7 +72,9 @@ zero-window探索の点数がbeta以上なら読み直しもせず、そのま�
 
 反復深化には、もう一つ窓を狭める材料がある。
 前のiterationのscoreである。
-depth 7のscoreがdepth 8で大きく動くことは少ないので、rootの窓を最初から`前回のscore ± aspiration_window`に絞って探索を始める（既定値は83）。
+depth 7のscoreがdepth 8で大きく動くことは少ないので、rootの窓を最初から`前回のscore ± aspiration_window`に絞って探索を始める（既定値は88）。
+完了したiteration間のscoreの変化を平滑化し、変化が大きい場合は初期幅をこの値の最大3倍まで広げる。
+scoreが安定すれば幅は基準値へ近づく。
 
 予測が当たれば、窓の外に出る枝が早く刈れてiteration全体が安くなる。
 外れてscoreが窓の外に落ちたときは、外れた側だけを「外れた値から幅の2倍」の位置まで広げて、そのiterationを読み直す。
@@ -81,8 +83,9 @@ depth 7のscoreがdepth 8で大きく動くことは少ないので、rootの窓
 
 ## iterationをまたぐ並べ替え
 
-各iterationの開始時には、前のiterationの最善手をroot movesの先頭へ動かす。
-rootの置換表entryに最善手が残っていれば、それも先頭へ引き上げる。
+各iterationを読み終えたら、最善手を先頭に置き、残りのroot movesを部分木に費やしたnode数の多い順に並べる。
+多く読まれた手ほど、最善手を覆しかけた有力な手である。
+rootの置換表entryに最善手が残っていれば、それも先頭へ引き上げる。先頭へ動かすときは他の手の順序を保つ。
 PVSもaspirationも「最初の手がおそらく最善」という前提に費用を賭ける方式なので、この並べ替えが前提の当たり率を直接支えている。
 
 ## 参考資料

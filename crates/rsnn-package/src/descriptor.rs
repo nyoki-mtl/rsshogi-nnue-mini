@@ -3,6 +3,29 @@ use serde::{Deserialize, Serialize};
 use crate::sfnnv15_feature_schema as schema;
 use crate::{Digest, Error, Result, evaluation_spec_hash};
 
+pub const SFNNV15_THREAT_SCHEMA_SHA256: &str =
+    "7dbe1308bf7b7a4a535dad79ad29f2ec8e2bc69811fbe4b4d54cd859f35888fd";
+
+pub fn verify_sfnnv15_threat_schema(
+    descriptor: &EvaluationDescriptor,
+    implementation_digest: Digest,
+) -> Result<()> {
+    let block = descriptor
+        .feature_schema
+        .blocks
+        .iter()
+        .find(|block| block.name == "threat")
+        .ok_or(Error::DescriptorMismatch { field: "feature_schema" })?;
+    if block.indexing != "occupied_target_threat_v1" {
+        return Err(Error::DescriptorMismatch { field: "feature_schema" });
+    }
+    let expected = Digest::from_hex(SFNNV15_THREAT_SCHEMA_SHA256)?;
+    if implementation_digest != expected {
+        return Err(Error::DescriptorMismatch { field: "threat_schema_digest" });
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DType {
@@ -251,37 +274,47 @@ impl EvaluationDescriptor {
         Self::sfnnv15_v2(tensors)
     }
 
-    /// 512-wide, base-only mobile `SFNNv15` contract.
+    /// A-only FT1024 with fixed KP progress and row-major dense tensors.
     #[must_use]
-    pub fn sfnnv15_mobile_v1(tensors: Vec<TensorDescriptor>) -> Self {
+    pub fn aonly1024_i8_progress8_v1(tensors: Vec<TensorDescriptor>) -> Self {
         let mut descriptor = Self::sfnnv15_v2(tensors);
-        descriptor.recipe_id = "sfnnv15_mobile_v1".into();
+        descriptor.recipe_id = "aonly1024_i8_progress8_v1".into();
         descriptor.recipe_version = 1;
-        descriptor.feature_schema.blocks.retain(|block| block.name != "threat");
-        descriptor.feature_schema.bucket_rule = "base_horizontal_king_bucket_v1".into();
+        descriptor.feature_schema = FeatureSchema {
+            id: "aonly_shogi".into(),
+            version: 1,
+            perspective: "friend_enemy_rotate180".into(),
+            blocks: vec![FeatureBlock {
+                name: "base".into(),
+                feature_count: 2344,
+                indexing: "aonly_full14_unaryhand_v1".into(),
+            }],
+            bucket_rule: "kp_absolute_progress_q16_v2".into(),
+        };
         descriptor
     }
-
     #[must_use]
-    pub fn sfnnv15_mobile_v1_schema() -> Self {
-        let mut descriptor = Self::sfnnv15_v2_schema();
-        descriptor = Self::sfnnv15_mobile_v1(descriptor.tensors);
-        descriptor.tensors.retain(|tensor| {
+    pub fn aonly1024_i8_progress8_v1_schema() -> Self {
+        let mut tensors = Self::sfnnv15_v2_schema().tensors;
+        tensors.retain(|tensor| {
             tensor.name != "ft_threat_weight" && tensor.name != "psqt_threat_weight"
         });
-        let mut offset = 0_u64;
-        for tensor in &mut descriptor.tensors {
+        let mut offset = 0;
+        for tensor in &mut tensors {
             match tensor.name.as_str() {
-                "ft_base_weight" => tensor.shape[1] = 512,
-                "ft_bias" => tensor.shape[0] = 512,
-                "fc0_weight" => tensor.shape[2] = 512,
+                "ft_base_weight" => {
+                    tensor.shape[0] = 2344;
+                    tensor.dtype = DType::I8;
+                }
+                "psqt_weight" => tensor.shape[0] = 2344,
+                "fc2_bias" => tensor.shape = vec![8, 1],
                 _ => {}
             }
             tensor.offset = offset;
             tensor.length = tensor.shape.iter().product::<u64>() * tensor.dtype.byte_width();
             offset += tensor.length;
         }
-        descriptor
+        Self::aonly1024_i8_progress8_v1(tensors)
     }
 }
 
@@ -354,18 +387,34 @@ impl EvaluatorExpectation {
     }
 }
 
-#[cfg(test)]
-mod mobile_tests {
-    use super::*;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaddingPolicy {
+    None,
+    ZeroFill,
+}
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportSpec {
+    pub schema_version: u32,
+    pub artifact_projection_version: u32,
+    pub rounding: String,
+    pub tensor_order: Vec<String>,
+    pub padding: PaddingPolicy,
+    pub container_version: u16,
+    pub auxiliary_artifacts: Vec<String>,
+}
+
+#[cfg(test)]
+mod aonly_tests {
+    use super::*;
     #[test]
-    fn mobile_schema_matches_trainer_contract() {
-        let descriptor = EvaluationDescriptor::sfnnv15_mobile_v1_schema();
-        assert_eq!(descriptor.tensors.len(), 9);
-        assert_eq!(descriptor.tensors[0].shape, [72_675, 512]);
-        assert_eq!(
-            descriptor.hash().unwrap().to_hex(),
-            "c13f6a8108dc14ce2c4a057d73f6b5fc526516fbc094fa50c1c66a06fc7486fd"
-        );
+    fn aonly_shapes_and_size() {
+        let d = EvaluationDescriptor::aonly1024_i8_progress8_v1_schema();
+        assert_eq!(d.tensors[0].shape, [2344, 1024]);
+        assert_eq!(d.tensors[0].dtype, DType::I8);
+        assert_eq!(d.tensors.iter().map(|t| t.length).sum::<u64>(), 2758944);
+        // Include the fixed KP artifact; metadata is accounted for by package tests.
+        assert_eq!(2_758_944 + 32 + 124_254 * 4, 3_255_992);
     }
 }

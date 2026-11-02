@@ -1,0 +1,4 @@
+module MiniEngineC {
+    header "rsshogi_nnue_mini.h"
+    export *
+}

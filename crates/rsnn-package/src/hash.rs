@@ -3,13 +3,14 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 
-use crate::descriptor::{DType, EvaluationDescriptor, TensorRole};
+use crate::descriptor::{DType, EvaluationDescriptor, ExportSpec, PaddingPolicy, TensorRole};
 use crate::{Error, Result};
 
 // Protocol identifiers, not user-facing artifact names. Changing one changes
 // every spec hash derived from it, so after the first release they only move
 // behind a version suffix.
 const EVALUATION_SPEC_HASH_DOMAIN: &[u8] = b"rsnn/evaluation-spec";
+const EXPORT_SPEC_HASH_DOMAIN: &[u8] = b"rsnn/export-spec";
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Digest([u8; 32]);
@@ -20,6 +21,11 @@ impl Digest {
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 
     pub fn from_hex(value: &str) -> Result<Self> {
@@ -221,6 +227,32 @@ pub fn evaluation_spec_hash(descriptor: &EvaluationDescriptor) -> Result<Digest>
         evaluation.engine_scale.numerator,
         evaluation.engine_scale.denominator,
     );
+    Ok(encoder.finish())
+}
+
+pub fn export_spec_hash(spec: &ExportSpec) -> Result<Digest> {
+    if spec.schema_version != 1 {
+        return Err(Error::InvalidManifestField(format!(
+            "unsupported export spec schema version {}",
+            spec.schema_version
+        )));
+    }
+    let mut encoder = Encoder::new(EXPORT_SPEC_HASH_DOMAIN, spec.schema_version);
+    encoder.u32(spec.artifact_projection_version);
+    encoder.string(&spec.rounding);
+    encoder.u64(spec.tensor_order.len() as u64);
+    for name in &spec.tensor_order {
+        encoder.string(name);
+    }
+    encoder.u8(match spec.padding {
+        PaddingPolicy::None => 0,
+        PaddingPolicy::ZeroFill => 1,
+    });
+    encoder.u16(spec.container_version);
+    encoder.u64(spec.auxiliary_artifacts.len() as u64);
+    for name in &spec.auxiliary_artifacts {
+        encoder.string(name);
+    }
     Ok(encoder.finish())
 }
 

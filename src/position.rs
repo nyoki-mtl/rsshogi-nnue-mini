@@ -1,3 +1,6 @@
+mod search_api;
+pub(crate) use search_api::{MoveFacts, SearchPositionExt};
+
 use rsshogi::board::{self, Move32List, Position, generate_legal_all_move32};
 use rsshogi::types::{Color, Hand, HandPiece, PieceType};
 use rsshogi_usi::PositionSpec;

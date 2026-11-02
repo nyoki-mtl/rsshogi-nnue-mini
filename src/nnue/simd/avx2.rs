@@ -2,7 +2,7 @@
 
 use std::arch::x86_64::*;
 
-use super::{Column, DENSE_OUTPUTS, WIDTH};
+use super::{Column, CompactColumn, DENSE_OUTPUTS, WIDTH};
 
 const LANES: usize = 16;
 
@@ -22,7 +22,20 @@ fn store(column: &mut Column, offset: usize, value: __m256i) {
     unsafe { _mm256_storeu_si256(column.0.as_mut_ptr().add(offset).cast(), value) }
 }
 
-pub(crate) fn update(dst: &mut Column, src: &Column, removed: &[&Column], added: &[&Column]) {
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load_weight(column: &CompactColumn, offset: usize) -> __m256i {
+    debug_assert!(offset + LANES <= WIDTH);
+    // SAFETY: 16 I8 lanes stay within this column; unaligned load is permitted.
+    unsafe { _mm256_cvtepi8_epi16(_mm_loadu_si128(column.0.as_ptr().add(offset).cast())) }
+}
+
+pub(crate) fn update(
+    dst: &mut Column,
+    src: &Column,
+    removed: &[&CompactColumn],
+    added: &[&CompactColumn],
+) {
     // A move changes one or two features per perspective. Fixing those counts at compile
     // time unrolls the per-column loops; refreshes with other counts take the general path.
     // SAFETY: this module is compiled only for builds that enable AVX2.
@@ -39,22 +52,27 @@ pub(crate) fn update(dst: &mut Column, src: &Column, removed: &[&Column], added:
 fn update_fixed_avx2<const N: usize>(
     dst: &mut Column,
     src: &Column,
-    removed: [&Column; N],
-    added: [&Column; N],
+    removed: [&CompactColumn; N],
+    added: [&CompactColumn; N],
 ) {
     update_avx2(dst, src, &removed, &added);
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn update_avx2(dst: &mut Column, src: &Column, removed: &[&Column], added: &[&Column]) {
+fn update_avx2(
+    dst: &mut Column,
+    src: &Column,
+    removed: &[&CompactColumn],
+    added: &[&CompactColumn],
+) {
     for offset in (0..WIDTH).step_by(LANES) {
         let mut value = load(src, offset);
         for column in removed {
-            value = _mm256_sub_epi16(value, load(column, offset));
+            value = _mm256_sub_epi16(value, load_weight(column, offset));
         }
         for column in added {
-            value = _mm256_add_epi16(value, load(column, offset));
+            value = _mm256_add_epi16(value, load_weight(column, offset));
         }
         store(dst, offset, value);
     }
@@ -81,7 +99,7 @@ fn pool_avx2(accumulators: [&Column; 2], output: &mut [u8; WIDTH]) {
             let packed = _mm256_packus_epi16(product(offset), product(offset + LANES));
             // packus interleaves 128-bit lanes; restore channel order.
             let ordered = _mm256_permute4x64_epi64::<0b11_01_10_00>(packed);
-            // SAFETY: 32 bytes at `half * 256 + offset` stay inside the 512-byte output.
+            // SAFETY: 32 bytes at `half * WIDTH / 2 + offset` stay inside the WIDTH-byte output.
             unsafe {
                 _mm256_storeu_si256(
                     output.as_mut_ptr().add(half * WIDTH / 2 + offset).cast(),
@@ -99,7 +117,13 @@ pub(crate) fn dense<const IN: usize>(
     output: &mut [i32; DENSE_OUTPUTS],
 ) {
     // SAFETY: this module is compiled only for builds that enable AVX2.
-    unsafe { dense_avx2::<IN>(weights, bias, input, output) }
+    unsafe {
+        if IN == 64 {
+            dense_all::<IN>(weights, bias, input, output);
+        } else {
+            dense_avx2::<IN>(weights, bias, input, output);
+        }
+    }
 }
 
 /// For each 8-bit mask, the positions of its set bits, padded with zeros.
@@ -179,6 +203,40 @@ fn dense_avx2<const IN: usize>(
 pub(crate) fn dot<const IN: usize>(weights: &[i8; IN], input: &[u8; IN]) -> i32 {
     // SAFETY: this module is compiled only for builds that enable AVX2.
     unsafe { dot_avx2::<IN>(weights, input) }
+}
+
+/// The 64-input second layer is small and mostly nonzero with the trained A-only
+/// model. Avoid building a sparse chunk list for that layer; keep it for FC0.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn dense_all<const IN: usize>(
+    weights: &[i8],
+    bias: &[i32; DENSE_OUTPUTS],
+    input: &[u8; IN],
+    output: &mut [i32; DENSE_OUTPUTS],
+) {
+    const { assert!(IN.is_multiple_of(32) && IN <= WIDTH) };
+    assert_eq!(weights.len(), IN * DENSE_OUTPUTS);
+    let ones = _mm256_set1_epi16(1);
+    // SAFETY: four vectors cover exactly the 32 biases and outputs. Each chunk
+    // accesses its four inputs and its contiguous 32-output weight block.
+    unsafe {
+        let mut sums: [__m256i; 4] =
+            std::array::from_fn(|i| _mm256_loadu_si256(bias.as_ptr().add(i * 8).cast()));
+        for chunk in 0..IN / 4 {
+            let packed = input.as_ptr().add(chunk * 4).cast::<i32>().read_unaligned();
+            let broadcast = _mm256_set1_epi32(packed);
+            for (i, sum) in sums.iter_mut().enumerate() {
+                let w = _mm256_loadu_si256(weights.as_ptr().add(chunk * 128 + i * 32).cast());
+                *sum = _mm256_add_epi32(
+                    *sum,
+                    _mm256_madd_epi16(_mm256_maddubs_epi16(broadcast, w), ones),
+                );
+            }
+        }
+        for (i, sum) in sums.into_iter().enumerate() {
+            _mm256_storeu_si256(output.as_mut_ptr().add(i * 8).cast(), sum);
+        }
+    }
 }
 
 #[target_feature(enable = "avx2")]

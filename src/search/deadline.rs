@@ -1,7 +1,9 @@
 //! 起点を引き直せる探索の締切を提供する。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::Instant;
 
 /// 予算を保持したまま、起点だけをあとから引き直せる締切。
 ///

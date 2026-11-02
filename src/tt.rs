@@ -8,7 +8,8 @@
 //! pack配置:
 //! - keymove語: [63:32] key検証子(高32bit^低32bitのfold)、[31:0] move32 raw
 //! - data語: [63:48] score(i16)、[47:32] static_eval(i16、`i16::MIN`はNone)、
-//!   [31:24] depth(u8)、[23:22] bound(1=Lower/2=Upper/3=Exact)、[21:16] 世代(6bit)
+//!   [31:24] depth(u8)、[23:22] bound(1=Lower/2=Upper/3=Exact)、[21:16] 世代(6bit)、
+//!   [15] PV上で読まれたか
 //!
 //! boundに0を使わないため、有効なentryのdata語は0にならない。
 //! `data == 0`は空slotを意味する。
@@ -35,6 +36,8 @@ pub struct TtEntry {
     /// 手番側から見た静的評価。高価な再評価を省くための添え物で、
     /// 詰み系のentryなど評価していない局面では`None`。
     pub static_eval: Option<i32>,
+    /// このnodeがPV上で読まれたことがあるか。PVを外れた後も縮小を控える目印にする。
+    pub pv: bool,
 }
 
 /// 16Bのslotを4つで64B、cache line 1本に収める。
@@ -54,6 +57,7 @@ const EVAL_SHIFT: u32 = 32;
 const DEPTH_SHIFT: u32 = 24;
 const BOUND_SHIFT: u32 = 22;
 const GENERATION_SHIFT: u32 = 16;
+const PV_SHIFT: u32 = 15;
 
 /// XOR trickつきのslot。`guard = keymove ^ data`。
 #[derive(Default)]
@@ -103,7 +107,8 @@ fn encode(entry: &TtEntry, generation: u32) -> (u64, u64) {
         | (u64::from(eval as u16) << EVAL_SHIFT)
         | (u64::from(entry.depth.min(u8::MAX as u32) as u8) << DEPTH_SHIFT)
         | (bound << BOUND_SHIFT)
-        | (u64::from(generation & GENERATION_MASK) << GENERATION_SHIFT);
+        | (u64::from(generation & GENERATION_MASK) << GENERATION_SHIFT)
+        | (u64::from(entry.pv) << PV_SHIFT);
     (keymove, data)
 }
 
@@ -124,6 +129,7 @@ fn decode(key: u64, keymove: u64, data: u64) -> TtEntry {
         bound,
         best_move: (move_raw != 0).then(|| Move32::from_raw(move_raw)),
         static_eval: (eval != EVAL_NONE).then_some(i32::from(eval)),
+        pv: (data >> PV_SHIFT) & 1 == 1,
     }
 }
 
@@ -206,6 +212,35 @@ impl TranspositionTable {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 先頭の最大1000 clusterで、現世代の使用slotを千分率で概算する。
+    /// data語だけを読み、世代更新やentryの書き戻しは行わない。
+    pub fn hashfull(&self) -> u32 {
+        let generation = self.generation.load(Ordering::Relaxed) & GENERATION_MASK;
+        let sample = &self.clusters[..self.clusters.len().min(1000)];
+        let used = sample
+            .iter()
+            .flat_map(|cluster| &cluster.0)
+            .filter(|slot| {
+                let data = slot.data.load(Ordering::Relaxed);
+                data != 0 && stored_generation(data) == generation
+            })
+            .count();
+        (used * 1000 / (sample.len() * CLUSTER_SIZE)) as u32
+    }
+
+    /// 子探索で読むclusterを先読みする。表の値は変更しない。
+    #[inline]
+    pub(crate) fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            // SAFETY: このtableが所有する有効なclusterの先頭を指し、hintの間も生存する。
+            unsafe { _mm_prefetch(self.cluster(key).as_ptr().cast(), _MM_HINT_T0) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
     pub fn clear(&self) {
         for cluster in self.clusters.iter() {
             for slot in &cluster.0 {
@@ -237,7 +272,15 @@ mod tests {
     use super::*;
 
     fn entry(key: u64, depth: u32, score: i32) -> TtEntry {
-        TtEntry { key, depth, score, bound: Bound::Exact, best_move: None, static_eval: None }
+        TtEntry {
+            key,
+            depth,
+            score,
+            bound: Bound::Exact,
+            best_move: None,
+            static_eval: None,
+            pv: false,
+        }
     }
 
     #[test]
@@ -247,6 +290,35 @@ mod tests {
         assert_eq!(table.probe(7), Some(entry(7, 3, 42)));
         table.clear();
         assert_eq!(table.probe(7), None);
+    }
+
+    #[test]
+    fn hashfull_samples_current_generation_without_refreshing_entries() {
+        let table = TranspositionTable::new(1);
+        assert_eq!(table.hashfull(), 0);
+        table.new_search();
+        let clusters = table.cluster_count() as u64;
+        for index in 0..1000 {
+            for slot in 0..CLUSTER_SIZE {
+                table.store(entry(index + clusters * slot as u64, 3, 42));
+            }
+        }
+        assert_eq!(table.hashfull(), 1000);
+        table.new_search();
+        assert_eq!(table.hashfull(), 0, "older entries are not current generation usage");
+        assert!(table.probe(0).is_some(), "measurement must not clear entries");
+        table.store(entry(0, 3, 42));
+        assert_eq!(table.hashfull(), 0, "one slot rounds down to zero per mille");
+        for key in 1..4 {
+            table.store(entry(key, 3, 42));
+        }
+        assert_eq!(table.hashfull(), 1);
+        for _ in 0..GENERATION_MASK {
+            table.new_search();
+        }
+        assert_eq!(table.hashfull(), 999, "generation wrapping matches stored generation bits");
+        table.clear();
+        assert_eq!(table.hashfull(), 0);
     }
 
     #[test]
@@ -269,6 +341,7 @@ mod tests {
                 bound,
                 best_move: Some(mv),
                 static_eval: eval,
+                pv: false,
             };
             table.store(stored);
             assert_eq!(table.probe(stored.key), Some(stored));

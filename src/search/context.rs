@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rsshogi::board::Position;
-use rsshogi::types::{Color, Move32, RepetitionState};
+use rsshogi::types::{Bitboard, Color, Move32, RepetitionState};
 
 use crate::eval::Evaluator;
 use crate::nnue::MAX_NNUE_EVAL;
@@ -12,10 +12,17 @@ use crate::params::SearchParams;
 use crate::position::MAX_SEARCH_PLY;
 use crate::tt::TranspositionTable;
 
-use super::history::{CONTINUATION_PLIES, HistoryTables};
+use super::history::{CONTINUATION_PLIES, HistoryTables, piece_to_index};
 use super::lmr::LmrReductions;
 use super::ordering::OrderingBuffer;
 use super::{MAX_QPLY, SearchLimits};
+
+/// 時間で止める探索で、共有のnode数へまとめて加算し、締切を確かめる間隔(node数)。
+///
+/// 全workerが毎nodeで同じatomicへ加算し時計を読むと、Threads>1ではcache lineの
+/// 取り合いが、1 threadでも時計の読み出しが無視できない費用になる。
+/// 止まるのが最大でこの数のnodeだけ遅れる。
+const NODE_BATCH: u64 = 256;
 
 const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
@@ -34,13 +41,23 @@ pub(crate) struct SearchContext {
     pub(super) lmr: LmrReductions,
     /// plyごとに再利用する並べ替えバッファ。毎ノードのVec確保を避ける。
     pub(super) ordering: Vec<OrderingBuffer>,
-    /// plyごとに「そこで指した手のpiece-to index」。null moveは`None`。
+    /// plyごとの捕獲文脈つきpiece-to index。null moveは`None`。
     /// continuation historyがこれを遡って直前の手を引く。
     pub(super) continuation: Vec<Option<usize>>,
     /// plyごとに、singularの判定探索で読まない手。判定探索の間だけ設定する。
     pub(super) excluded: Vec<Option<Move32>>,
     /// 実行中のiterationのdepth。延長が際限なく続かないよう、延長できるplyを制限する。
     pub(super) root_depth: u32,
+    /// null cutを検証しているnodeのply。同じnodeで再びnullを試さない。
+    pub(super) null_verification_ply: Option<u32>,
+    /// plyごとのβカット数。親nodeが子を読む間に兄弟で起きたカットを数える。
+    cutoffs: Vec<u32>,
+    /// plyごとに、子を縮小探索している間だけその縮小量を置く。子が事後に深さを調整する。
+    reductions: Vec<u32>,
+    /// 共有のnode数へまだ加算していない、このworkerのnode数。
+    pending_nodes: u64,
+    /// このworkerが受理されたnodeの累計。rootの手ごとの探索量に使う。
+    local_nodes: u64,
 }
 
 /// 全workerが共有する停止・ponder状態、node数、置換表。
@@ -53,6 +70,40 @@ pub(super) struct SharedSearch {
 }
 
 impl SearchContext {
+    /// 確保領域を残し、次のgoの意味上の状態だけを初期化する。
+    pub(super) fn prepare(
+        &mut self,
+        evaluator: &Evaluator,
+        params: SearchParams,
+        limits: SearchLimits,
+        shared: SharedSearch,
+    ) {
+        self.evaluator.prepare(evaluator);
+        if self.params.lmr_divisor != params.lmr_divisor {
+            self.lmr = LmrReductions::new(params.lmr_divisor);
+        }
+        self.params = params;
+        self.killers.resize(limits.max_depth as usize + MAX_QPLY as usize + 4, [None; 2]);
+        self.killers.fill([None; 2]);
+        for buffer in &mut self.ordering {
+            buffer.clear();
+        }
+        self.continuation.fill(None);
+        self.excluded.fill(None);
+        self.cutoffs.fill(0);
+        self.reductions.fill(0);
+        self.root_depth = 0;
+        self.null_verification_ply = None;
+        self.pending_nodes = 0;
+        self.local_nodes = 0;
+        self.limits = limits;
+        let SharedSearch { cancel, pondering, nodes, table } = shared;
+        self.cancel = cancel;
+        self.pondering = pondering;
+        self.nodes = nodes;
+        self.table = table;
+    }
+
     pub(super) fn new(
         evaluator: Evaluator,
         params: SearchParams,
@@ -78,23 +129,49 @@ impl SearchContext {
             continuation: vec![None; per_ply],
             excluded: vec![None; per_ply],
             root_depth: 0,
+            null_verification_ply: None,
+            cutoffs: vec![0; per_ply + 2],
+            reductions: vec![0; per_ply],
+            pending_nodes: 0,
+            local_nodes: 0,
         }
     }
 
     pub(super) fn enter_node(&mut self) -> Option<()> {
-        if self.cancel.load(Ordering::Relaxed) || self.hard_deadline_expired() {
+        if self.cancel.load(Ordering::Relaxed) {
             return None;
         }
         if let Some(limit) = self.limits.max_nodes {
+            // node数で止める探索は上限を正確に守るため、1 nodeずつ共有の数へ加算する。
+            if self.hard_deadline_expired() {
+                return None;
+            }
             self.nodes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nodes| {
                     (nodes < limit).then_some(nodes + 1)
                 })
                 .ok()?;
-        } else {
-            self.nodes.fetch_add(1, Ordering::Relaxed);
+            self.local_nodes += 1;
+            return Some(());
         }
+        // まとめの最初のnodeでだけ締切を確かめ、まとめが埋まったら共有の数へ加算する。
+        if self.pending_nodes == 0 && self.hard_deadline_expired() {
+            return None;
+        }
+        self.pending_nodes += 1;
+        if self.pending_nodes == NODE_BATCH {
+            self.flush_nodes();
+        }
+        self.local_nodes += 1;
         Some(())
+    }
+
+    /// まだ共有のnode数へ加算していない分を加算する。worker終了時にも呼ぶ。
+    pub(super) fn flush_nodes(&mut self) {
+        if self.pending_nodes > 0 {
+            self.nodes.fetch_add(self.pending_nodes, Ordering::Relaxed);
+            self.pending_nodes = 0;
+        }
     }
 
     pub(super) fn should_stop(&self) -> bool {
@@ -119,8 +196,14 @@ impl SearchContext {
                 .is_some_and(|deadline| deadline.scaled_soft_expired(scale))
     }
 
+    /// 全workerのnode数。このworkerの未加算分を含む(他workerの未加算分は含まない)。
     pub(super) fn node_count(&self) -> u64 {
-        self.nodes.load(Ordering::Relaxed)
+        self.nodes.load(Ordering::Relaxed) + self.pending_nodes
+    }
+
+    /// 他workerの進行や、共有counterへ反映するタイミングに依存しない探索量。
+    pub(super) fn local_node_count(&self) -> u64 {
+        self.local_nodes
     }
 
     /// 生の静的評価へcorrection historyの補正を足す。
@@ -152,13 +235,50 @@ impl SearchContext {
         }
     }
 
-    /// 直前と2手前のpiece-to index。遡れない範囲は`None`。
+    /// 直前と2手前の捕獲文脈つきpiece-to index。遡れない範囲は`None`。
     pub(super) fn previous_continuations(&self, ply: u32) -> [Option<usize>; CONTINUATION_PLIES] {
         std::array::from_fn(|offset| {
             (ply as usize)
                 .checked_sub(offset + 1)
                 .and_then(|index| self.continuation.get(index).copied().flatten())
         })
+    }
+
+    /// plyで子へ掛けている縮小量を置く。縮小探索が終われば0へ戻す。
+    pub(super) fn set_reduction(&mut self, ply: u32, reduction: u32) {
+        if let Some(slot) = self.reductions.get_mut(ply as usize) {
+            *slot = reduction;
+        }
+    }
+
+    /// plyで子へ掛けている縮小量。
+    pub(super) fn reduction(&self, ply: u32) -> u32 {
+        self.reductions.get(ply as usize).copied().unwrap_or(0)
+    }
+
+    /// plyのβカット数を0へ戻す。
+    pub(super) fn reset_cutoffs(&mut self, ply: u32) {
+        if let Some(slot) = self.cutoffs.get_mut(ply as usize) {
+            *slot = 0;
+        }
+    }
+
+    /// plyで起きたβカットを数える。
+    pub(super) fn add_cutoff(&mut self, ply: u32) {
+        if let Some(slot) = self.cutoffs.get_mut(ply as usize) {
+            *slot += 1;
+        }
+    }
+
+    /// plyで数えたβカット数。
+    pub(super) fn cutoffs(&self, ply: u32) -> u32 {
+        self.cutoffs.get(ply as usize).copied().unwrap_or(0)
+    }
+
+    /// 縮小探索がαを超えた静かな手を、直前の手に続く手としてcontinuation historyで褒める。
+    pub(super) fn record_continuation_bonus(&mut self, ply: u32, mv: Move32, bonus: i32) {
+        let previous = self.previous_continuations(ply);
+        self.history.continuations.record(&previous, piece_to_index(mv), bonus);
     }
 
     /// 静かな手のβカットを履歴テーブルとkillerへ記録する。
@@ -172,8 +292,9 @@ impl SearchContext {
         tried_quiets: &[Move32],
         depth: u32,
         ply: u32,
+        threats: Bitboard,
     ) {
-        self.history.record_quiet_cutoff(stm, mv, tried_quiets, depth);
+        self.history.record_quiet_cutoff(stm, mv, tried_quiets, depth, threats);
         let previous = self.previous_continuations(ply);
         self.history.record_continuation_cutoff(&previous, mv, tried_quiets, depth);
 
@@ -237,6 +358,55 @@ mod tests {
     use super::super::SearchDeadline;
     use super::super::test_support::test_context;
     use super::*;
+
+    #[test]
+    fn prepare_resets_transient_state_and_updates_snapshots_without_reallocating() {
+        let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
+        context.killers[0] = [Some(rsshogi::types::MOVE_NULL); 2];
+        context.continuation[0] = Some(1);
+        context.excluded[0] = Some(rsshogi::types::MOVE_NULL);
+        context.cutoffs[0] = 9;
+        context.reductions[0] = 3;
+        context.root_depth = 12;
+        context.null_verification_ply = Some(2);
+        context.pending_nodes = 7;
+        context.local_nodes = 99;
+        let ordering = context.ordering.as_ptr();
+        let continuation = context.continuation.as_ptr();
+        let before = context.lmr.base_fine(10, 20);
+        let mut params = context.params;
+        params.lmr_divisor *= 2;
+        let eval = crate::eval::EvalParams { pawn: 123, ..Default::default() };
+        let shared = SharedSearch {
+            cancel: Arc::new(AtomicBool::new(false)),
+            pondering: Arc::new(AtomicBool::new(true)),
+            nodes: Arc::new(AtomicU64::new(4)),
+            table: Arc::new(TranspositionTable::new(1)),
+        };
+        context.prepare(
+            &Evaluator::material(eval),
+            params,
+            super::super::test_support::depth_limits(2),
+            shared.clone(),
+        );
+        assert_eq!(context.ordering.as_ptr(), ordering);
+        assert_eq!(context.continuation.as_ptr(), continuation);
+        assert!(context.killers.iter().all(|entry| *entry == [None; 2]));
+        assert!(context.continuation.iter().all(Option::is_none));
+        assert!(context.excluded.iter().all(Option::is_none));
+        assert!(context.cutoffs.iter().all(|value| *value == 0));
+        assert!(context.reductions.iter().all(|value| *value == 0));
+        assert_eq!(context.root_depth, 0);
+        assert_eq!(context.null_verification_ply, None);
+        assert_eq!((context.pending_nodes, context.local_nodes), (0, 0));
+        assert_eq!(context.params, params);
+        assert_eq!(context.evaluator.params(), eval);
+        assert!(context.lmr.base_fine(10, 20) < before);
+        assert!(Arc::ptr_eq(&context.cancel, &shared.cancel));
+        assert!(Arc::ptr_eq(&context.pondering, &shared.pondering));
+        assert!(Arc::ptr_eq(&context.nodes, &shared.nodes));
+        assert!(Arc::ptr_eq(&context.table, &shared.table));
+    }
 
     #[test]
     fn max_moves_tt_key_includes_game_ply() {
@@ -329,6 +499,30 @@ mod tests {
     }
 
     #[test]
+    fn local_nodes_ignore_other_workers_and_count_only_admitted_nodes() {
+        for limit in [None, Some(NODE_BATCH + 2)] {
+            let nodes = Arc::new(AtomicU64::new(0));
+            let mut context = test_context(Arc::clone(&nodes), limit);
+            for _ in 0..NODE_BATCH + 1 {
+                context.enter_node().expect("node admitted");
+            }
+            assert_eq!(context.local_node_count(), NODE_BATCH + 1);
+            // 別workerの進行を模す。自workerの累計には混ざらない。
+            nodes.fetch_add(100, Ordering::Relaxed);
+            context.flush_nodes();
+            assert_eq!(context.node_count(), NODE_BATCH + 101);
+            assert_eq!(context.local_node_count(), NODE_BATCH + 1);
+            if limit.is_some() {
+                assert!(context.enter_node().is_none(), "shared budget exhausted");
+            } else {
+                context.cancel.store(true, Ordering::Relaxed);
+                assert!(context.enter_node().is_none(), "cancelled node not admitted");
+            }
+            assert_eq!(context.local_node_count(), NODE_BATCH + 1);
+        }
+    }
+
+    #[test]
     fn ponder_suppresses_only_the_deadline() {
         let pondering = Arc::new(AtomicBool::new(true));
         let mut context = test_context(Arc::new(AtomicU64::new(0)), None);
@@ -337,6 +531,8 @@ mod tests {
 
         assert!(context.enter_node().is_some(), "pondering must suppress the time deadline");
         pondering.store(false, Ordering::Release);
-        assert!(context.enter_node().is_none(), "ponderhit must reactivate the same deadline");
+        // 締切はnodeのまとめごとに確かめるので、遅くとも次のまとめの最初で止まる。
+        let stopped = (0..=NODE_BATCH).any(|_| context.enter_node().is_none());
+        assert!(stopped, "ponderhit must reactivate the same deadline");
     }
 }

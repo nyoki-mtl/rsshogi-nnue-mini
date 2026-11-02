@@ -1,17 +1,22 @@
 //! Portable reference kernels. Every vector backend must return exactly these values.
 
-use super::{Column, DENSE_OUTPUTS, WIDTH};
+use super::{Column, CompactColumn, DENSE_OUTPUTS, WIDTH};
 
-pub(crate) fn update(dst: &mut Column, src: &Column, removed: &[&Column], added: &[&Column]) {
+pub(crate) fn update(
+    dst: &mut Column,
+    src: &Column,
+    removed: &[&CompactColumn],
+    added: &[&CompactColumn],
+) {
     dst.0.copy_from_slice(&src.0);
     for column in removed {
         for (value, &weight) in dst.0.iter_mut().zip(&column.0) {
-            *value = value.wrapping_sub(weight);
+            *value = value.wrapping_sub(i16::from(weight));
         }
     }
     for column in added {
         for (value, &weight) in dst.0.iter_mut().zip(&column.0) {
-            *value = value.wrapping_add(weight);
+            *value = value.wrapping_add(i16::from(weight));
         }
     }
 }

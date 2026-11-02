@@ -129,12 +129,13 @@ pub(super) fn should_try_null_move(
     static_eval: i32,
     beta: i32,
     plies_from_null: u16,
+    eval_margin: i32,
 ) -> bool {
     zero_window
         && !in_check
         && beta > -MATE_TT_THRESHOLD
         && plies_from_null > 0
-        && static_eval >= beta
+        && static_eval >= beta + eval_margin
 }
 
 /// null moveの動的縮小量 `R = base + depth/depth_divisor + min((static_eval - beta) / eval_divisor, 3)`。
@@ -181,13 +182,13 @@ mod tests {
 
     #[test]
     fn null_move_guard_requires_every_conservative_precondition() {
-        assert!(should_try_null_move(true, false, 20, 20, 1));
-        assert!(!should_try_null_move(false, false, 20, 20, 1));
-        assert!(!should_try_null_move(true, true, 20, 20, 1));
-        assert!(!should_try_null_move(true, false, 19, 20, 1));
-        assert!(!should_try_null_move(true, false, 20, 20, 0));
-        assert!(!should_try_null_move(true, false, 0, -MATE_TT_THRESHOLD, 1));
-        assert!(should_try_null_move(true, false, 0, -MATE_TT_THRESHOLD + 1, 1));
+        assert!(should_try_null_move(true, false, 20, 20, 1, 0));
+        assert!(!should_try_null_move(false, false, 20, 20, 1, 0));
+        assert!(!should_try_null_move(true, true, 20, 20, 1, 0));
+        assert!(!should_try_null_move(true, false, 19, 20, 1, 0));
+        assert!(!should_try_null_move(true, false, 20, 20, 0, 0));
+        assert!(!should_try_null_move(true, false, 0, -MATE_TT_THRESHOLD, 1, 0));
+        assert!(should_try_null_move(true, false, 0, -MATE_TT_THRESHOLD + 1, 1, 0));
     }
 
     #[test]
@@ -386,6 +387,7 @@ mod tests {
             bound: Bound::Lower,
             best_move: None,
             static_eval: None,
+            pv: false,
         };
         assert!(should_try_singular(10, 3, 12, &entry, 7));
         assert!(!should_try_singular(6, 3, 12, &entry, 7), "浅いnodeでは試さない");

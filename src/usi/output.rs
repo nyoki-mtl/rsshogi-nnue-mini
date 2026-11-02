@@ -12,7 +12,7 @@ pub(super) fn write_search_info<W: Write>(
     writer: &mut W,
     info: &SearchIteration,
 ) -> io::Result<()> {
-    write_info(writer, info.depth, info.score, info.nodes, info.elapsed, &info.pv)
+    write_info(writer, info.depth, info.score, info.nodes, info.elapsed, info.hashfull, &info.pv)
 }
 
 pub(super) fn write_info<W: Write>(
@@ -21,12 +21,17 @@ pub(super) fn write_info<W: Write>(
     score: i32,
     nodes: u64,
     elapsed: Duration,
+    hashfull: u32,
     pv: &[rsshogi::types::Move32],
 ) -> io::Result<()> {
     let elapsed_ms = elapsed.as_millis().try_into().unwrap_or(u64::MAX);
     let nps = nodes.saturating_mul(1_000) / elapsed_ms.max(1);
-    let mut info =
-        InfoCommand::new().with_depth(depth).with_nodes(nodes).with_time(elapsed_ms).with_nps(nps);
+    let mut info = InfoCommand::new()
+        .with_depth(depth)
+        .with_nodes(nodes)
+        .with_time(elapsed_ms)
+        .with_nps(nps)
+        .with_hashfull(hashfull);
     // 距離0は整数の符号を保持できないため、勝敗だけを表すUSIの`+`/`-`へ変換する。
     info = match search::mate_distance(score) {
         Some(0) if score.is_negative() => info.with_score_mate(MateScore::unknown_lose()),
@@ -42,7 +47,15 @@ pub(super) fn write_info<W: Write>(
 }
 
 pub(super) fn write_bestmove<W: Write>(writer: &mut W, result: &SearchResult) -> io::Result<()> {
-    write_info(writer, result.depth, result.score, result.nodes, result.elapsed, &result.pv)?;
+    write_info(
+        writer,
+        result.depth,
+        result.score,
+        result.nodes,
+        result.elapsed,
+        result.hashfull,
+        &result.pv,
+    )?;
     let bestmove = match result.best_move {
         Some(mv) if mv == MOVE_WIN => BestMove::win(),
         Some(mv) => BestMove::move_to(mv.to_usi())

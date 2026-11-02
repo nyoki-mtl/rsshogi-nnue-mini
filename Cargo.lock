@@ -111,9 +111,9 @@ dependencies = [
 
 [[package]]
 name = "rsshogi"
-version = "1.2.5"
+version = "1.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "282a79301f91a42af4c802895760bfc817cf686c0c72d0eb1390f82cd9da6404"
+checksum = "49903ab1dfa110a2d5931f9a0a1c83edd876e3ad57668ba5b070ae22193d0ce6"
 dependencies = [
  "log",
  "thiserror",
@@ -121,11 +121,13 @@ dependencies = [
 
 [[package]]
 name = "rsshogi-nnue-mini"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "rsnn-package",
  "rsshogi",
  "rsshogi-usi",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

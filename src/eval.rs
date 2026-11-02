@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rsshogi::board::Position;
 use rsshogi::types::{Color, Hand, HandPiece, Move32, PieceType};
 
-use crate::nnue::{AccumulatorStack, MAX_NNUE_EVAL, MobileNetwork};
+use crate::nnue::{AccumulatorStack, AonlyNetwork, MAX_NNUE_EVAL};
 
 #[derive(Clone)]
 pub struct Evaluator {
@@ -13,27 +13,39 @@ pub struct Evaluator {
 
 #[derive(Clone)]
 struct NnueEvaluator {
-    network: Arc<MobileNetwork>,
-    fv_scale: i32,
+    network: Arc<AonlyNetwork>,
     stack: AccumulatorStack,
 }
 
 impl Evaluator {
+    /// 次の探索の評価器snapshotを採用し、NNUEのframe確保領域は再利用する。
+    /// frameの値は探索開始時のinitializeで新しいnetworkから作り直す。
+    pub(crate) fn prepare(&mut self, source: &Self) {
+        self.params = source.params;
+        match (&mut self.nnue, &source.nnue) {
+            (Some(current), Some(next)) => current.network = Arc::clone(&next.network),
+            (_, Some(next)) => {
+                self.nnue = Some(NnueEvaluator {
+                    network: Arc::clone(&next.network),
+                    stack: AccumulatorStack::default(),
+                });
+            }
+            (_, None) => self.nnue = None,
+        }
+    }
+
     pub const fn material(params: EvalParams) -> Self {
         Self { params, nnue: None }
     }
 
-    pub fn nnue(params: EvalParams, network: Arc<MobileNetwork>, fv_scale: i32) -> Self {
-        Self {
-            params,
-            nnue: Some(NnueEvaluator { network, fv_scale, stack: AccumulatorStack::default() }),
-        }
+    pub fn nnue(params: EvalParams, network: Arc<AonlyNetwork>) -> Self {
+        Self { params, nnue: Some(NnueEvaluator { network, stack: AccumulatorStack::default() }) }
     }
 
     /// 探索中の局面を評価する。NNUEでは`initialize`後の`advance`/`undo`と対応していること。
     pub fn evaluate(&mut self, position: &Position) -> i32 {
         match &mut self.nnue {
-            Some(nnue) => nnue.stack.evaluate(&nnue.network, position, nnue.fv_scale),
+            Some(nnue) => nnue.stack.evaluate(&nnue.network, position),
             None => evaluate_material(position, self.params),
         }
     }

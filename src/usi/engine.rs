@@ -13,10 +13,10 @@ use rsshogi_usi::{CheckmateResponse, GoParams, UsiCommand, UsiOption, parse_line
 
 use crate::eval::EvalParams;
 use crate::eval::Evaluator;
-use crate::nnue::{DEFAULT_FV_SCALE, MobileNetwork};
+use crate::nnue::AonlyNetwork;
 use crate::params::SearchParams;
 #[cfg(feature = "tuning")]
-use crate::params::{FV_SCALE_RANGE, tunable_manifest};
+use crate::params::tunable_manifest;
 use crate::position::{MAX_ROOT_GAME_PLY, replay};
 use crate::search::{SearchControl, SearchDeadline, SearchEvent, SearchJob, SearchResult};
 
@@ -35,12 +35,11 @@ pub(super) struct Engine {
     pub(super) eval_params: EvalParams,
     pub(super) search_params: SearchParams,
     pub(super) eval_file: String,
-    pub(super) fv_scale: i32,
     pub(super) threads: usize,
     pub(super) entering_king_rule: EnteringKingRule,
     pub(super) max_moves_to_draw: u32,
     pub(super) move_overhead_ms: u64,
-    pub(super) network: Option<Arc<MobileNetwork>>,
+    pub(super) network: Option<Arc<AonlyNetwork>>,
     pub(super) search: Option<SearchTask>,
     pub(super) worker: SearchWorkerRuntime,
     pub(super) quit: bool,
@@ -57,7 +56,6 @@ impl Engine {
             eval_params: EvalParams::default(),
             search_params: SearchParams::default(),
             eval_file: DEFAULT_EVAL_FILE.to_owned(),
-            fv_scale: DEFAULT_FV_SCALE,
             threads: DEFAULT_THREADS,
             entering_king_rule: DEFAULT_ENTERING_KING_RULE,
             max_moves_to_draw: 0,
@@ -79,10 +77,7 @@ impl Engine {
             {
                 write_raw(
                     writer,
-                    &format!(
-                        "info string shogiarena_tunables_json {}",
-                        tunable_manifest(DEFAULT_FV_SCALE)
-                    ),
+                    &format!("info string shogiarena_tunables_json {}", tunable_manifest()),
                 )?;
                 write_raw(writer, "usi_tunablesok")?;
             }
@@ -199,23 +194,11 @@ impl Engine {
                     self.stop_search(false, writer)?;
                     self.eval_file = path.to_owned();
                     self.network = None;
-                    self.worker.clear();
+                    self.worker.reset();
                 }
                 None => {
                     write_command(writer, &UsiCommand::info_string("EvalPackage requires a path"))?
                 }
-            },
-            #[cfg(feature = "tuning")]
-            "FV_SCALE" => match parse_in_range(value, FV_SCALE_RANGE.0..=FV_SCALE_RANGE.1) {
-                Some(scale) => {
-                    self.stop_search(false, writer)?;
-                    self.fv_scale = scale;
-                    self.worker.clear();
-                }
-                _ => write_command(
-                    writer,
-                    &UsiCommand::info_string("FV_SCALE must be an integer in 1..=128"),
-                )?,
             },
             "USI_Hash" => match parse_in_range(value, 1..=MAX_HASH_MB) {
                 Some(megabytes) => {
@@ -297,7 +280,7 @@ impl Engine {
         let ponder = params.ponder;
         let position = self.position.clone();
         let evaluator = match self.network.as_ref() {
-            Some(network) => Evaluator::nnue(self.eval_params, Arc::clone(network), self.fv_scale),
+            Some(network) => Evaluator::nnue(self.eval_params, Arc::clone(network)),
             None => {
                 debug_assert!(self.material_test_mode());
                 Evaluator::material(self.eval_params)
@@ -341,19 +324,19 @@ impl Engine {
 
         #[cfg(feature = "embedded-rsnn")]
         let loaded = if self.eval_file == "@default" {
-            MobileNetwork::load_embedded()
+            AonlyNetwork::load_embedded()
         } else {
-            MobileNetwork::load(std::path::Path::new(&self.eval_file), None)
+            AonlyNetwork::load(std::path::Path::new(&self.eval_file), None)
         };
         #[cfg(not(feature = "embedded-rsnn"))]
-        let loaded = MobileNetwork::load(std::path::Path::new(&self.eval_file), None);
+        let loaded = AonlyNetwork::load(std::path::Path::new(&self.eval_file), None);
 
         match loaded {
             Ok(network) => {
                 write_command(
                     writer,
                     &UsiCommand::info_string(format!(
-                        "loaded mobile .rsnn: {} digest={}",
+                        "loaded A-only .rsnn: {} digest={}",
                         self.eval_file,
                         network.digest()
                     )),
@@ -485,13 +468,6 @@ fn usi_options() -> Vec<UsiOption> {
     options.extend(SearchParams::usi_options());
     options.push(UsiOption::check("USI_Ponder", false));
     options.push(UsiOption::string("EvalPackage", DEFAULT_EVAL_FILE));
-    #[cfg(feature = "tuning")]
-    options.push(UsiOption::spin(
-        "FV_SCALE",
-        i64::from(DEFAULT_FV_SCALE),
-        i64::from(FV_SCALE_RANGE.0),
-        i64::from(FV_SCALE_RANGE.1),
-    ));
     // 以下2つのoption名と値はやねうら王互換。GUIや運用scriptの設定を
     // 他engineと共通のまま使えるようにするため、独自名へは変えない。
     let default_rule = ENTERING_KING_RULES

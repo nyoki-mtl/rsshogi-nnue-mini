@@ -80,7 +80,65 @@ impl Manifest {
     }
 }
 
-/// A parsed and validated `.rsnn` container with its digest.
+/// Write-side input of the `.rsnn` lifecycle.
+///
+/// Lifecycle stages: `Package` (about to be written) -> [`ReadPackage`]
+/// (parsed and digested) -> `nnue_runtime::nnue::package_loader::LoadedPackage`
+/// (materialized for a target CPU).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Package {
+    pub manifest: Manifest,
+    pub payload: Vec<u8>,
+}
+
+pub struct PackageWriter;
+
+impl PackageWriter {
+    pub fn write(package: &Package) -> Result<Vec<u8>> {
+        let limits = PackageLimits::default();
+        validate_manifest(&package.manifest, &package.payload, limits)?;
+        let manifest = package.manifest.canonical_json()?;
+        let manifest_len = u64::try_from(manifest.len()).map_err(|_| Error::LengthOverflow)?;
+        if manifest_len > limits.max_manifest_bytes {
+            return Err(Error::ManifestTooLarge {
+                found: manifest_len,
+                limit: limits.max_manifest_bytes,
+            });
+        }
+        let payload_len =
+            u64::try_from(package.payload.len()).map_err(|_| Error::LengthOverflow)?;
+        if payload_len > limits.max_payload_bytes {
+            return Err(Error::PayloadTooLarge {
+                found: payload_len,
+                limit: limits.max_payload_bytes,
+            });
+        }
+        let capacity = HEADER_LEN
+            .checked_add(manifest.len())
+            .and_then(|value| value.checked_add(package.payload.len()))
+            .ok_or(Error::LengthOverflow)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&manifest_len.to_le_bytes());
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&manifest);
+        bytes.extend_from_slice(&package.payload);
+        Ok(bytes)
+    }
+
+    pub fn write_file(path: impl AsRef<Path>, package: &Package) -> Result<Digest> {
+        let bytes = Self::write(package)?;
+        let digest = sha256(&bytes);
+        fs::write(path, bytes)?;
+        Ok(digest)
+    }
+}
+
+/// Read-side result of the `.rsnn` lifecycle: a parsed [`Package`] plus its
+/// container digest. Materializing it yields
+/// `nnue_runtime::nnue::package_loader::LoadedPackage`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPackage {
     pub manifest: Manifest,

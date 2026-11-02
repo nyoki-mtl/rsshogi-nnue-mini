@@ -1,14 +1,10 @@
 /target/
 /dist/
-/.shogiarena-venv/
-/.uv-cache/
 /eval/
-/runs/
-/work_dir/
-/csa-logs/
-/.verification/
 /docs/book/book/
 *.exe
 *.nnue
 *.rsnn
+*.wasm
+__pycache__/
 

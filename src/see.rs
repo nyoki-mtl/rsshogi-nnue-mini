@@ -1,3 +1,4 @@
+use crate::position::SearchPositionExt;
 use rsshogi::board::Position;
 use rsshogi::types::{Bitboard, Color, Move32, PieceType, Square};
 
@@ -22,7 +23,7 @@ const MAX_EXCHANGE_PLIES: usize = 40;
 /// 玉での取り返しだけは、相手に攻撃駒が残っている間は行わない。
 /// 合法手生成を使わない実装で、これを外すと玉が自殺する読み筋を評価してしまう。
 pub fn static_exchange_eval(position: &Position, mv: Move32, params: EvalParams) -> Option<i32> {
-    let metadata = position.move32_metadata(mv);
+    let metadata = position.move_facts(mv);
     if !metadata.is_capture() {
         return None;
     }
@@ -33,24 +34,64 @@ pub fn static_exchange_eval(position: &Position, mv: Move32, params: EvalParams)
         return None;
     }
 
-    let mover = position.turn();
     let mut occupied = position.pieces();
     occupied.clear(from);
 
-    let mut gains = [0i32; MAX_EXCHANGE_PLIES];
-    gains[0] = capture_gain(metadata.captured_piece_type(), params)
+    let gain = capture_gain(metadata.captured_piece_type(), params)
         + promotion_gain(
             position.moved_piece_before(mv).piece_type(),
             metadata.is_promotion(),
             params,
         );
     // 取り返されたときに相手が得る、いま対象マスに立っている駒の価値。
-    let mut standing = capture_gain(position.moved_piece_after(mv).piece_type(), params);
+    let standing = capture_gain(position.moved_piece_after(mv).piece_type(), params);
+    Some(exchange_value(position, target, occupied, gain, standing, params))
+}
 
-    let mut side = mover.flip();
+/// Evaluate a legal noncapture, including a drop or promotion, from the mover's
+/// perspective. Captures retain the separate public SEE contract above.
+/// The same initial-pin and local-exchange approximations apply.
+pub(crate) fn quiet_static_exchange_eval(
+    position: &Position,
+    mv: Move32,
+    params: EvalParams,
+) -> Option<i32> {
+    let metadata = position.move_facts(mv);
+    if metadata.is_capture() {
+        return None;
+    }
+    let mut occupied = position.pieces();
+    if !mv.from_sq().is_none() {
+        occupied.clear(mv.from_sq());
+    }
+    occupied.set(mv.to_sq());
+    let gain = promotion_gain(
+        position.moved_piece_before(mv).piece_type(),
+        metadata.is_promotion(),
+        params,
+    );
+    let standing = capture_gain(position.moved_piece_after(mv).piece_type(), params);
+    Some(exchange_value(position, mv.to_sq(), occupied, gain, standing, params))
+}
+
+fn exchange_value(
+    position: &Position,
+    target: Square,
+    mut occupied: Bitboard,
+    gain: i32,
+    mut standing: i32,
+    params: EvalParams,
+) -> i32 {
+    let mut gains = [0i32; MAX_EXCHANGE_PLIES];
+    gains[0] = gain;
+
+    let mut side = position.turn().flip();
     let mut depth = 0usize;
     while depth + 1 < MAX_EXCHANGE_PLIES {
-        let attackers = position.attackers_to(target, occupied) & occupied;
+        let mut attackers = position.attackers_to(target, occupied) & occupied;
+        // The standing piece is an occupant, never a recapture candidate. Piece
+        // masks still describe the initial board, including an old capture victim.
+        attackers.clear(target);
         let Some((square, piece_type)) =
             least_valuable_attacker(position, attackers, target, side, params)
         else {
@@ -75,7 +116,7 @@ pub fn static_exchange_eval(position: &Position, mv: Move32, params: EvalParams)
         gains[depth - 1] = -(-gains[depth - 1]).max(gains[depth]);
         depth -= 1;
     }
-    Some(gains[0])
+    gains[0]
 }
 
 /// 駒を取ったときの駒得。盤上から消える分と持ち駒に増える分の両方を数える。
@@ -148,7 +189,6 @@ mod tests {
     /// 降りられるものとして取り合いの結果を求める。
     fn exact_exchange_eval(position: &Position, mv: Move32, params: EvalParams) -> i32 {
         assert!(position.is_legal_move32(mv), "the oracle requires a legal move");
-        assert!(position.move32_metadata(mv).is_capture(), "the oracle requires a capture");
         let target = mv.to_sq();
         let mut exchange = position.clone_for_search();
         let gain = apply_material_delta(&mut exchange, mv, params);
@@ -160,7 +200,7 @@ mod tests {
         generate_legal_all_move32(position, &mut moves);
         let mut best = 0;
         for mv in moves.as_slice().iter().copied() {
-            if mv.to_sq() != target || !position.move32_metadata(mv).is_capture() {
+            if mv.to_sq() != target || !position.move_facts(mv).is_capture() {
                 continue;
             }
             let gain = apply_material_delta(position, mv, params);
@@ -194,6 +234,53 @@ mod tests {
         let position = board::position_from_sfen(sfen).expect("valid SFEN");
         let mv = board::move_from_usi(&position, usi).expect("valid move text");
         exact_exchange_eval(&position, mv, EvalParams::default())
+    }
+
+    fn quiet_see(sfen: &str, usi: &str) -> i32 {
+        let position = board::position_from_sfen(sfen).expect("valid SFEN");
+        let before_sfen = position.to_sfen(None);
+        let before_key = position.key();
+        let mv = board::move_from_usi(&position, usi).expect("valid move text");
+        let result = quiet_static_exchange_eval(&position, mv, EvalParams::default())
+            .expect("a noncapture must be evaluated");
+        assert_eq!(result, exact_exchange_eval(&position, mv, EvalParams::default()));
+        assert_eq!(position.to_sfen(None), before_sfen);
+        assert_eq!(position.key(), before_key);
+        result
+    }
+
+    #[test]
+    fn scores_hanging_and_safe_quiet_moves() {
+        assert_eq!(quiet_see("k8/9/9/4p4/9/4R4/9/9/8K b - 1", "5f5e"), -2_000);
+        assert_eq!(quiet_see("k8/9/9/9/9/4R4/9/9/8K b - 1", "5f5e"), 0);
+    }
+
+    #[test]
+    fn clears_the_quiet_moves_origin_for_xrays() {
+        assert_eq!(quiet_see("k8/9/2b6/3S5/9/9/9/9/8K b - 1", "6d5e"), -900);
+    }
+
+    #[test]
+    fn scores_defended_and_hanging_drops() {
+        assert_eq!(quiet_see("k8/9/9/4s4/9/5G3/9/9/8K b P 1", "P*5e"), 0);
+        assert_eq!(quiet_see("k8/9/9/4s4/9/9/9/9/8K b P 1", "P*5e"), -200);
+        assert_eq!(quiet_see("k8/9/9/4p4/9/5G3/9/9/8K b S 1", "S*5e"), -700);
+    }
+
+    #[test]
+    fn includes_noncapture_promotion_gain_and_promoted_piece_loss() {
+        assert_eq!(quiet_see("k8/9/9/4P4/9/9/9/9/8K b - 1", "5d5c+"), 350);
+        assert_eq!(quiet_see("k8/4s4/9/4P4/9/9/9/9/8K b - 1", "5d5c+"), -200);
+        assert_eq!(quiet_see("k8/9/9/9/9/4p4/9/9/8K w - 1", "5f5g+"), 350);
+    }
+
+    #[test]
+    fn quiet_see_rejects_captures_without_changing_capture_see() {
+        let position =
+            board::position_from_sfen("4k4/9/9/4s4/4P4/9/9/9/4K4 b - 1").expect("valid SFEN");
+        let mv = board::move_from_usi(&position, "5e5d").expect("legal capture");
+        assert_eq!(quiet_static_exchange_eval(&position, mv, EvalParams::default()), None);
+        assert_eq!(static_exchange_eval(&position, mv, EvalParams::default()), Some(900));
     }
 
     #[test]

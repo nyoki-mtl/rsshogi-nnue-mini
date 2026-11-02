@@ -1,4 +1,4 @@
-//! Vector kernels for SFNNv15 inference, chosen at compile time.
+//! Vector kernels for A-only inference, chosen at compile time.
 //!
 //! - x86-64 with `-C target-feature=+avx2`: [`avx2`]
 //! - aarch64 (iOS, Android, Apple Silicon): [`neon`]; the dense layers use `sdot` when the
@@ -31,9 +31,11 @@ use neon as backend;
 )))]
 use scalar as backend;
 
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
+pub(crate) use avx2::dense_all;
 pub(crate) use backend::{dense, dot, pool, update};
 
-pub(crate) const WIDTH: usize = 512;
+pub(crate) const WIDTH: usize = 1024;
 pub(crate) const DENSE_OUTPUTS: usize = 32;
 
 /// Name of the route this process runs. Tests use it to catch a build that silently fell back.
@@ -50,7 +52,12 @@ pub(crate) fn route() -> &'static str {
     return "scalar";
 }
 
-/// One accumulator perspective or one feature-transformer column, cache-line aligned.
+/// One compact feature-transformer column, widened only inside update kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub(crate) struct CompactColumn(pub(crate) [i8; WIDTH]);
+
+/// One accumulator perspective, cache-line aligned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
 pub(crate) struct Column(pub(crate) [i16; WIDTH]);
@@ -95,17 +102,31 @@ mod tests {
         let mut next = random_stream(11);
         for _ in 0..200 {
             let src = column(&mut next, i64::from(i16::MIN), i64::from(i16::MAX));
-            let columns: Vec<Column> = (0..40)
-                .map(|_| column(&mut next, i64::from(i16::MIN), i64::from(i16::MAX)))
+            let columns: Vec<CompactColumn> = (0..40)
+                .map(|_| CompactColumn(std::array::from_fn(|_| next(-127, 127) as i8)))
                 .collect();
-            let refs: Vec<&Column> = columns.iter().collect();
-            // Move deltas use up to two columns per side; cache refreshes use up to 40.
+            let refs: Vec<&CompactColumn> = columns.iter().collect();
+            // Move deltas use up to two columns per side; root initialization uses up to 40.
             let removed = &refs[..next(0, 20) as usize];
             let added = &refs[20..20 + next(0, 20) as usize];
             let (mut expected, mut actual) = (Column::ZERO, Column::ZERO);
             scalar::update(&mut expected, &src, removed, added);
             update(&mut actual, &src, removed, added);
             assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn compact_columns_stay_compact_and_sign_extend_at_lane_boundaries() {
+        assert_eq!(std::mem::size_of::<CompactColumn>(), WIDTH);
+        assert_eq!(std::mem::size_of::<Column>(), 2 * WIDTH);
+        let removed = CompactColumn(std::array::from_fn(|i| if i % 2 == 0 { -127 } else { 127 }));
+        let added = CompactColumn(std::array::from_fn(|i| if i % 2 == 0 { 127 } else { -127 }));
+        let src = Column([0; WIDTH]);
+        let mut actual = Column::ZERO;
+        update(&mut actual, &src, &[&removed], &[&added]);
+        for (i, value) in actual.0.into_iter().enumerate() {
+            assert_eq!(value, if i % 2 == 0 { 254 } else { -254 });
         }
     }
 

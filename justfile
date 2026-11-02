@@ -44,12 +44,17 @@ book:
 	mdbook build docs/book
 
 check-mobile:
-	cargo clippy --target aarch64-apple-ios --all-targets -- -D warnings
-	cargo build --release --lib --target aarch64-apple-ios
-	cargo clippy --target aarch64-linux-android --all-targets -- -D warnings
-	cargo build --release --lib --target aarch64-linux-android
-	$env:RUSTFLAGS = "-C target-feature=+dotprod"; cargo clippy --target aarch64-apple-ios --all-targets -- -D warnings
-	$env:RUSTFLAGS = "-C target-feature=+dotprod"; cargo build --release --lib --target aarch64-apple-ios
-	$env:RUSTFLAGS = "-C target-feature=+dotprod"; cargo clippy --target aarch64-linux-android --all-targets -- -D warnings
-	$env:RUSTFLAGS = "-C target-feature=+dotprod"; cargo build --release --lib --target aarch64-linux-android
+	cargo clippy --target aarch64-apple-ios --lib --features c-api -- -D warnings
+	cargo clippy --target aarch64-linux-android --lib --features c-api -- -D warnings
+	$env:RUSTFLAGS = "-C target-feature=+dotprod"; cargo clippy --target aarch64-apple-ios --lib --features c-api -- -D warnings
+	$env:RUSTFLAGS = "-C target-feature=+dotprod"; cargo clippy --target aarch64-linux-android --lib --features c-api -- -D warnings
+
+sdk-windows:
+	pwsh -NoProfile -File scripts/build_sdk.ps1
+
+sdk-wasm:
+	pwsh -NoProfile -File scripts/build_wasm.ps1
+
+sdk-wasm-embedded model_path:
+	pwsh -NoProfile -File scripts/build_wasm.ps1 -ModelPath "{{model_path}}"
 

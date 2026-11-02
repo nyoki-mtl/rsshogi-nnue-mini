@@ -1,10 +1,10 @@
-//! `.rsnn` container validation before the SFNNv15 inference layer is materialized.
+//! `.rsnn` container validation before the A-only inference layer is materialized.
 
 use std::path::Path;
 
 use rsnn_package::{Digest, EvaluationDescriptor, PackageReader, ReadPackage};
 
-/// Validated portable package whose descriptor matches the SFNNv15 recipe.
+/// Validated portable package whose descriptor matches the A-only recipe.
 #[derive(Debug)]
 pub struct RsnnPackage {
     pub(super) contents: ReadPackage,
@@ -18,7 +18,6 @@ impl RsnnPackage {
         Self::from_read_package(contents)
     }
 
-    #[cfg(feature = "embedded-rsnn")]
     pub fn load_bytes(bytes: &[u8], expected_digest: Digest) -> Result<Self, String> {
         let contents = PackageReader::default()
             .read(bytes, Some(expected_digest))
@@ -27,7 +26,7 @@ impl RsnnPackage {
     }
 
     fn from_read_package(contents: ReadPackage) -> Result<Self, String> {
-        let expected = EvaluationDescriptor::sfnnv15_mobile_v1_schema();
+        let expected = EvaluationDescriptor::aonly1024_i8_progress8_v1_schema();
         let actual = &contents.manifest.evaluation_descriptor;
         if actual.schema_version != expected.schema_version
             || actual.recipe_id != expected.recipe_id
@@ -56,26 +55,5 @@ impl RsnnPackage {
 
     pub fn digest(&self) -> Digest {
         self.contents.package_digest
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[ignore = "requires RSSHOGI_RSNN_FIXTURE"]
-    fn trained_package_matches_the_supported_recipe() {
-        let path = std::env::var_os("RSSHOGI_RSNN_FIXTURE")
-            .expect("set RSSHOGI_RSNN_FIXTURE to a qualified .rsnn package");
-        let expected_digest =
-            Digest::from_hex("9e3a3f8f74088a8c430ddd06617ff6cc8e35a979623c2082e1fb1d34befc5a36")
-                .expect("literal digest");
-        let package = RsnnPackage::load(Path::new(&path), Some(expected_digest))
-            .expect("qualified SFNNv15 package loads");
-        assert_eq!(package.digest(), expected_digest);
-        let mut unsupported = package.contents;
-        unsupported.manifest.evaluation_descriptor.recipe_version += 1;
-        assert!(RsnnPackage::from_read_package(unsupported).is_err());
     }
 }

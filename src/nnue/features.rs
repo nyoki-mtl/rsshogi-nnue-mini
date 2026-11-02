@@ -1,13 +1,13 @@
-//! Position and move conversion into perspective-independent SFNNv15 feature atoms.
+//! Position and move conversion into perspective-independent A-only feature atoms.
 
-use rsnn_package::sfnnv15_feature_schema::{
+use rsnn_package::aonly_feature_schema::{
     AbsoluteOwner, BaseFeatureDelta, BoardFeatureKind, HandFeatureKind, SemanticAtom,
 };
 use rsshogi::board::Position;
 use rsshogi::types::{Color, Hand, HandPiece, Move32, Piece, PieceType, Square};
 
 /// Upper bound on active base features: 38 board pieces, two kings, and no more.
-pub(super) const MAX_ACTIVE: usize = rsnn_package::sfnnv15_feature_schema::BASE_MAX_ACTIVE;
+pub(super) const MAX_ACTIVE: usize = rsnn_package::aonly_feature_schema::BASE_MAX_ACTIVE;
 
 const HAND_DOMAINS: [(HandFeatureKind, HandPiece); 7] = [
     (HandFeatureKind::Pawn, HandPiece::PAWN),
@@ -19,87 +19,7 @@ const HAND_DOMAINS: [(HandFeatureKind, HandPiece); 7] = [
     (HandFeatureKind::Rook, HandPiece::ROOK),
 ];
 
-/// Board pieces and hand counts, kept by the refresh cache to diff against a new position.
-#[derive(Clone, Copy)]
-pub(super) struct Placement {
-    board: [Piece; SQUARES],
-    hands: [[u8; HAND_DOMAINS.len()]; 2],
-}
-
-/// Atoms of one side of a diff. A diff between two legal positions has at most
-/// `MAX_ACTIVE` atoms on each side.
-pub(super) struct AtomList {
-    atoms: [SemanticAtom; MAX_ACTIVE],
-    len: usize,
-}
-
-const SQUARES: usize = 81;
-
-impl Placement {
-    pub(super) const EMPTY: Self =
-        Self { board: [Piece::NONE; SQUARES], hands: [[0; HAND_DOMAINS.len()]; 2] };
-
-    pub(super) fn of(position: &Position) -> Self {
-        let mut placement = Self::EMPTY;
-        for square in Square::iter() {
-            placement.board[square.to_index()] = position.piece_on(square);
-        }
-        for (hands, color) in placement.hands.iter_mut().zip([Color::BLACK, Color::WHITE]) {
-            for (count, &(_, hand_piece)) in hands.iter_mut().zip(&HAND_DOMAINS) {
-                *count = Hand::count_of(position.hand(color), hand_piece) as u8;
-            }
-        }
-        placement
-    }
-
-    /// Atoms active in `self` but not in `next` go to `removed`, and the reverse to `added`.
-    pub(super) fn diff(&self, next: &Self, removed: &mut AtomList, added: &mut AtomList) {
-        for (square, (&old, &new)) in Square::iter().zip(self.board.iter().zip(&next.board)) {
-            if old == new {
-                continue;
-            }
-            if !old.is_empty() {
-                removed.push(board_atom(old, square).expect("cached board piece is valid"));
-            }
-            if !new.is_empty() {
-                added.push(board_atom(new, square).expect("legal board piece is valid"));
-            }
-        }
-        for (color, (old_hands, new_hands)) in
-            [Color::BLACK, Color::WHITE].into_iter().zip(self.hands.iter().zip(&next.hands))
-        {
-            for (&(kind, _), (&old, &new)) in
-                HAND_DOMAINS.iter().zip(old_hands.iter().zip(new_hands))
-            {
-                // Hand features are unary, so only the slots between the two counts change.
-                let (list, slots) =
-                    if old > new { (&mut *removed, new..old) } else { (&mut *added, old..new) };
-                for slot in slots {
-                    list.push(hand_atom(color, kind, u32::from(slot)).expect("legal hand slot"));
-                }
-            }
-        }
-    }
-}
-
-impl AtomList {
-    pub(super) fn new() -> Self {
-        let filler = SemanticAtom::king(AbsoluteOwner::Black, 0).expect("square 0 is valid");
-        Self { atoms: [filler; MAX_ACTIVE], len: 0 }
-    }
-
-    fn push(&mut self, atom: SemanticAtom) {
-        self.atoms[self.len] = atom;
-        self.len += 1;
-    }
-
-    pub(super) fn as_slice(&self) -> &[SemanticAtom] {
-        &self.atoms[..self.len]
-    }
-}
-
 /// Every active atom of `position`: board pieces, both kings, and unary hand slots.
-#[cfg(test)]
 pub(super) fn position_atoms(position: &Position) -> Result<Vec<SemanticAtom>, String> {
     let mut atoms = Vec::with_capacity(MAX_ACTIVE);
     for square in Square::iter() {
@@ -112,8 +32,8 @@ pub(super) fn position_atoms(position: &Position) -> Result<Vec<SemanticAtom>, S
     for color in [Color::BLACK, Color::WHITE] {
         for &(kind, hand_piece) in &HAND_DOMAINS {
             let count = Hand::count_of(position.hand(color), hand_piece);
-            if count > u32::from(rsnn_package::sfnnv15_feature_schema::HAND_MAX[kind as usize]) {
-                return Err("SFNNv15 hand count exceeds schema".to_owned());
+            if count > u32::from(rsnn_package::aonly_feature_schema::HAND_MAX[kind as usize]) {
+                return Err("A-only hand count exceeds schema".to_owned());
             }
             for slot in 0..count {
                 atoms.push(hand_atom(color, kind, slot)?);
@@ -121,7 +41,7 @@ pub(super) fn position_atoms(position: &Position) -> Result<Vec<SemanticAtom>, S
         }
     }
     if atoms.len() > MAX_ACTIVE {
-        return Err("SFNNv15 position has more than 40 features".to_owned());
+        return Err("A-only position has more than 40 features".to_owned());
     }
     Ok(atoms)
 }
@@ -180,7 +100,7 @@ fn hand_atom(color: Color, kind: HandFeatureKind, slot: u32) -> Result<SemanticA
     u8::try_from(slot)
         .ok()
         .and_then(|slot| SemanticAtom::hand(owner(color), kind, slot))
-        .ok_or_else(|| "invalid SFNNv15 hand feature".to_owned())
+        .ok_or_else(|| "invalid A-only hand feature".to_owned())
 }
 
 fn board_atom(piece: Piece, square: Square) -> Result<SemanticAtom, String> {
@@ -190,7 +110,7 @@ fn board_atom(piece: Piece, square: Square) -> Result<SemanticAtom, String> {
     } else {
         SemanticAtom::board(owner(piece.color()), board_kind(piece.piece_type())?, square)
     };
-    atom.ok_or_else(|| "invalid SFNNv15 board feature".to_owned())
+    atom.ok_or_else(|| "invalid A-only board feature".to_owned())
 }
 
 fn board_kind(piece_type: PieceType) -> Result<BoardFeatureKind, String> {
@@ -199,15 +119,15 @@ fn board_kind(piece_type: PieceType) -> Result<BoardFeatureKind, String> {
         PieceType::LANCE => Ok(BoardFeatureKind::Lance),
         PieceType::KNIGHT => Ok(BoardFeatureKind::Knight),
         PieceType::SILVER => Ok(BoardFeatureKind::Silver),
-        PieceType::GOLD
-        | PieceType::PRO_PAWN
-        | PieceType::PRO_LANCE
-        | PieceType::PRO_KNIGHT
-        | PieceType::PRO_SILVER => Ok(BoardFeatureKind::Gold),
+        PieceType::GOLD => Ok(BoardFeatureKind::Gold),
+        PieceType::PRO_PAWN => Ok(BoardFeatureKind::ProPawn),
+        PieceType::PRO_LANCE => Ok(BoardFeatureKind::ProLance),
+        PieceType::PRO_KNIGHT => Ok(BoardFeatureKind::ProKnight),
+        PieceType::PRO_SILVER => Ok(BoardFeatureKind::ProSilver),
         PieceType::BISHOP => Ok(BoardFeatureKind::Bishop),
         PieceType::HORSE => Ok(BoardFeatureKind::Horse),
         PieceType::ROOK => Ok(BoardFeatureKind::Rook),
         PieceType::DRAGON => Ok(BoardFeatureKind::Dragon),
-        _ => Err("unsupported SFNNv15 board piece".to_owned()),
+        _ => Err("unsupported A-only board piece".to_owned()),
     }
 }
