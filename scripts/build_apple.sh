@@ -30,10 +30,8 @@ elif [[ -n "${RSSHOGI_EMBEDDED_RSNN_SHA256:-}" ]]; then
     exit 1
 fi
 target_dir="$repo_root/target/sdk-apple"
-headers="$target_dir/headers"
-mkdir -p "$headers"
-cp include/rsshogi_nnue_mini.h "$headers/"
-cp bindings/apple/module.modulemap "$headers/"
+headers="$repo_root/bindings/apple/include"
+mkdir -p "$target_dir"
 targets=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin)
 # Opt in to Intel slices without combining device and simulator archives.
 if [[ "${MINI_APPLE_INTEL:-0}" == 1 ]]; then
@@ -66,7 +64,7 @@ cargo rustc --locked --release --lib --crate-type cdylib --features "$features" 
 host_lib="$target_dir/$host_target/release"
 xcrun swiftc -swift-version 6 -I "$headers" -L "$host_lib" -lrsshogi_nnue_mini \
     -Xlinker -rpath -Xlinker "$host_lib" \
-    bindings/apple/MiniEngine.swift scripts/check_apple.swift -o "$target_dir/check-apple"
+    bindings/apple/MiniEngine.swift bindings/apple/check.swift -o "$target_dir/check-apple"
 "$target_dir/check-apple"
 cargo build --locked --release --bin rsshogi-nnue-mini --features "$features" \
     --target aarch64-apple-darwin --target-dir "$target_dir"

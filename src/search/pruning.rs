@@ -2,9 +2,8 @@
 //!
 //! どれも局面を動かさない純粋な関数で、適用と再探索は`negamax`側が行う。
 
-use crate::params::SearchParams;
-use crate::tt::{Bound, TtEntry};
-
+use super::params::SearchParams;
+use super::tt::{Bound, TtEntry};
 use super::{CaptureSee, MATE_TT_THRESHOLD};
 
 /// IIR: TT moveが無く十分深いノードは1浅く探索する。

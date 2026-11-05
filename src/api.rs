@@ -9,14 +9,12 @@ use rsshogi::types::EnteringKingRule;
 use rsshogi_usi::PositionSpec;
 use serde::{Deserialize, Serialize};
 
-use crate::eval::{EvalParams, Evaluator};
-use crate::nnue::AonlyNetwork;
-use crate::params::SearchParams;
+use crate::eval::{AOnlyNetwork, EvalParams, Evaluator};
 use crate::position::{MAX_SEARCH_DEPTH, replay};
 use crate::search::{
-    SearchControl, SearchDeadline, SearchEvent, SearchJob, SearchLimits, SearchWorkers,
+    SearchControl, SearchCoordinator, SearchDeadline, SearchEvent, SearchJob, SearchLimits,
+    SearchParams, TranspositionTable,
 };
-use crate::tt::TranspositionTable;
 
 /// Clone before running a blocking search to cancel it from another native thread.
 /// A stop issued just before search entry also cancels that next search.
@@ -71,13 +69,13 @@ pub struct SearchOutput {
     pub pv: Vec<String>,
 }
 
-/// Independent position, evaluator, transposition table and persistent worker contexts.
+/// Independent position, evaluator, transposition table and persistent search coordinator.
 /// Methods are synchronous and require exclusive access. Run search on a host background queue.
 pub struct Engine {
     position: Position,
-    network: Option<Arc<AonlyNetwork>>,
+    network: Option<Arc<AOnlyNetwork>>,
     table: Arc<TranspositionTable>,
-    workers: Option<SearchWorkers>,
+    coordinator: Option<SearchCoordinator>,
     threads: usize,
     hash_mb: usize,
     stop: StopHandle,
@@ -97,7 +95,7 @@ impl Engine {
             position: initial_position(),
             network: None,
             table: Arc::new(TranspositionTable::new(16)),
-            workers: None,
+            coordinator: None,
             threads: 1,
             hash_mb: 16,
             stop: StopHandle::default(),
@@ -110,14 +108,14 @@ impl Engine {
 
     /// Model errors leave the previously loaded evaluator intact.
     pub fn load_model(&mut self, bytes: &[u8]) -> Result<String, String> {
-        let network = AonlyNetwork::load_bytes(bytes)?;
+        let network = AOnlyNetwork::load_bytes(bytes)?;
         Ok(self.install(network))
     }
 
     pub fn load_embedded(&mut self) -> Result<String, String> {
         #[cfg(feature = "embedded-rsnn")]
         {
-            Ok(self.install(AonlyNetwork::load_embedded()?))
+            Ok(self.install(AOnlyNetwork::load_embedded()?))
         }
         #[cfg(not(feature = "embedded-rsnn"))]
         {
@@ -125,9 +123,9 @@ impl Engine {
         }
     }
 
-    fn install(&mut self, network: AonlyNetwork) -> String {
+    fn install(&mut self, network: AOnlyNetwork) -> String {
         let digest = network.digest().to_hex();
-        self.workers = None;
+        self.coordinator = None;
         self.network = Some(Arc::new(network));
         self.table.clear();
         digest
@@ -151,14 +149,14 @@ impl Engine {
         }
         if hash_mb != self.hash_mb {
             let table = Arc::new(TranspositionTable::new(hash_mb));
-            if let Some(workers) = &mut self.workers {
-                workers.set_table(&table);
+            if let Some(coordinator) = &mut self.coordinator {
+                coordinator.set_table(&table);
             }
             self.table = table;
             self.hash_mb = hash_mb;
         }
         if threads != self.threads {
-            self.workers = None;
+            self.coordinator = None;
             self.table.clear();
             self.threads = threads;
         }
@@ -188,8 +186,8 @@ impl Engine {
     pub fn new_game(&mut self) {
         self.position = initial_position();
         self.table.clear();
-        if let Some(workers) = &mut self.workers {
-            workers.clear();
+        if let Some(coordinator) = &mut self.coordinator {
+            coordinator.clear();
         }
     }
 
@@ -204,7 +202,7 @@ impl Engine {
         Ok(Evaluator::nnue(EvalParams::default(), Arc::clone(network)))
     }
 
-    /// Runs the existing search driver on this calling thread, without a USI coordinator.
+    /// Runs the existing search driver on this calling thread, without a USI search bridge.
     /// On WebAssembly use a short movetime budget to yield control back to the host.
     pub fn search(&mut self, options: SearchOptions) -> Result<SearchOutput, String> {
         if !(1..=MAX_SEARCH_DEPTH).contains(&options.depth) {
@@ -219,11 +217,11 @@ impl Engine {
         // Do not clear cancel here: a host may stop after admitting the request but before entry.
         self.stop.searching.store(true, Ordering::Release);
         let _activity = SearchActivity(self.stop.clone());
-        let workers =
-            self.workers.get_or_insert_with(|| SearchWorkers::new(self.threads, &control));
+        let coordinator =
+            self.coordinator.get_or_insert_with(|| SearchCoordinator::new(self.threads, &control));
         let (events, receiver) = mpsc::channel();
         let budget = options.movetime_ms.map(Duration::from_millis);
-        workers.run(
+        coordinator.run(
             SearchJob {
                 position: self.position.clone(),
                 evaluator,
@@ -264,7 +262,7 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         let mut engine = Self::new();
-        engine.install(crate::nnue::synthetic_network(0x107));
+        engine.install(crate::eval::synthetic_network(0x107));
         engine
     }
 }
@@ -336,5 +334,67 @@ mod tests {
         let result = handle.join().unwrap();
         assert_ne!(result.bestmove, "resign");
         assert!(!stop.is_searching());
+    }
+
+    #[test]
+    fn fixed_depth_matches_coordinator_across_opening_lines() {
+        board::init();
+        let mut engine = Engine::fixture();
+        engine.configure(Some(16), Some(1)).unwrap();
+        let network = Arc::new(crate::eval::synthetic_network(0x107));
+
+        let dummy_control =
+            SearchControl::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut coordinator = SearchCoordinator::new(1, &dummy_control);
+        let table = Arc::new(TranspositionTable::new(16));
+
+        for moves in [&[][..], &["7g7f", "3c3d"][..], &["2g2f", "8c8d", "2f2e", "8d8e"][..]] {
+            let owned: Vec<String> = moves.iter().map(|&m| m.to_owned()).collect();
+            engine.new_game();
+            engine.set_position("startpos", &owned).unwrap();
+            let api_out =
+                engine.search(SearchOptions { depth: 3, ..SearchOptions::default() }).unwrap();
+
+            table.clear();
+            coordinator.clear();
+            let position = replay(&PositionSpec::StartPos, &owned).unwrap();
+            let (events, receiver) = mpsc::channel();
+            coordinator.run(
+                SearchJob {
+                    position,
+                    evaluator: Evaluator::nnue(EvalParams::default(), Arc::clone(&network)),
+                    params: SearchParams::default(),
+                    limits: SearchLimits {
+                        max_depth: 3,
+                        max_nodes: None,
+                        deadline: None,
+                        searchmoves: Vec::new(),
+                        max_moves_to_draw: 0,
+                    },
+                    control: SearchControl::new(
+                        Arc::new(AtomicBool::new(false)),
+                        Arc::new(AtomicBool::new(false)),
+                    ),
+                    events,
+                    threads: 1,
+                },
+                Arc::clone(&table),
+            );
+            let direct = receiver
+                .into_iter()
+                .find_map(|event| match event {
+                    SearchEvent::Done(done) => Some(done),
+                    SearchEvent::Info(_) => None,
+                })
+                .unwrap();
+
+            assert_eq!(api_out.depth, direct.depth);
+            assert_eq!(api_out.score, direct.score);
+            assert_eq!(api_out.nodes, direct.nodes);
+            assert_eq!(api_out.bestmove, direct.best_move.unwrap().to_usi());
+            assert_eq!(api_out.ponder, direct.ponder_move.map(|m| m.to_usi()));
+            let direct_pv: Vec<String> = direct.pv.iter().map(|m| m.to_usi()).collect();
+            assert_eq!(api_out.pv, direct_pv);
+        }
     }
 }

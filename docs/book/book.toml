@@ -1,7 +1,7 @@
 [book]
-title = "rsshogi-nnue-mini の使い方"
+title = "rsshogi-nnue-mini ガイド"
 authors = ["rsshogi contributors"]
-description = "rsshogi-nnue-mini の導入と設定"
+description = "rsshogi-nnue-mini の導入・アプリ組み込み・内部アーキテクチャと探索アルゴリズムの解説"
 language = "ja"
 src = "src"
 

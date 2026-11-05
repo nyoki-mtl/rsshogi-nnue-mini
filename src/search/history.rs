@@ -15,7 +15,7 @@
 use rsshogi::board::Position;
 use rsshogi::types::{Bitboard, Color, MOVE_NONE, Move32, PieceType};
 
-use crate::params::SearchParams;
+use super::params::SearchParams;
 
 /// gravity更新の飽和上限。`|bonus| <= HISTORY_MAX`なら値はこの範囲を出ない。
 pub(super) const HISTORY_MAX: i32 = 16_384;
@@ -115,7 +115,7 @@ pub(super) fn continuation_index(mv: Move32, is_capture: bool) -> usize {
 ///
 /// main historyが「その手自体の良さ」を測るのに対し、これは
 /// 「この手の後にこの手が良い」という組を測る。
-pub(crate) struct ContinuationHistories {
+pub(super) struct ContinuationHistories {
     /// [直前の手の捕獲文脈とpiece-to][この手のpiece-to]。
     tables: [Box<[i16]>; CONTINUATION_PLIES],
 }
@@ -192,7 +192,7 @@ const CORRECTION_DIVISOR: i32 = 512;
 /// keyはrsshogiが差分維持している資産をそのまま使う。手駒キーは
 /// `key() ^ board_key()`(`key`は`board_key`と手駒寄与のXORで構成される)、
 /// 歩キーは`partial_keys().pawn`、玉位置対はindexの直接計算。
-pub(crate) struct CorrectionHistories {
+pub(super) struct CorrectionHistories {
     hand: Box<[[i32; CORRECTION_SIZE]; Color::COUNT]>,
     pawn: Box<[[i32; CORRECTION_SIZE]; Color::COUNT]>,
     king: Box<[[i32; KING_PAIR_SIZE]; Color::COUNT]>,
@@ -291,8 +291,8 @@ impl BonusShape {
     }
 }
 
-/// worker slotごとの履歴テーブル。対局中はUSIセッション側が保持して貸し出す。
-pub(crate) struct HistoryTables {
+/// worker slotごとの履歴テーブル。常駐workerの状態が所有して使い回す。
+pub(super) struct HistoryTables {
     bonus: BonusShape,
     /// [手番][from/toの一意index][脅威の区分]。gravity更新で±`HISTORY_MAX`に収まる。
     main: Box<[[[i32; THREAT_LANES]; FROM_TO_SIZE]; Color::COUNT]>,
@@ -475,28 +475,16 @@ mod tests {
         let cutoff = quiet_move(10, 20, Piece::B_SILVER);
         let tried = [quiet_move(30, 40, Piece::B_GOLD), quiet_move(50, 60, Piece::B_KNIGHT)];
 
-        tables.record_quiet_cutoff(
-            Color::BLACK,
-            cutoff,
-            &tried,
-            4,
-            rsshogi::types::Bitboard::EMPTY,
-        );
+        tables.record_quiet_cutoff(Color::BLACK, cutoff, &tried, 4, Bitboard::EMPTY);
 
         let bonus = history_fixture().cutoff_bonus(4);
         assert_eq!(bonus, 576);
-        assert_eq!(
-            tables.quiet_score(Color::BLACK, cutoff, rsshogi::types::Bitboard::EMPTY),
-            bonus
-        );
+        assert_eq!(tables.quiet_score(Color::BLACK, cutoff, Bitboard::EMPTY), bonus);
         for mv in tried {
-            assert_eq!(
-                tables.quiet_score(Color::BLACK, mv, rsshogi::types::Bitboard::EMPTY),
-                -bonus
-            );
+            assert_eq!(tables.quiet_score(Color::BLACK, mv, Bitboard::EMPTY), -bonus);
         }
         assert_eq!(
-            tables.quiet_score(Color::WHITE, cutoff, rsshogi::types::Bitboard::EMPTY),
+            tables.quiet_score(Color::WHITE, cutoff, Bitboard::EMPTY),
             0,
             "main historyは手番で分かれる"
         );
@@ -690,10 +678,10 @@ mod tests {
         let mut tables = HistoryTables::new();
         let drop = Move32::drop(PieceType::GOLD, Square::new(40), Color::BLACK);
 
-        tables.record_quiet_cutoff(Color::BLACK, drop, &[], 4, rsshogi::types::Bitboard::EMPTY);
+        tables.record_quiet_cutoff(Color::BLACK, drop, &[], 4, Bitboard::EMPTY);
 
         assert_eq!(
-            tables.quiet_score(Color::BLACK, drop, rsshogi::types::Bitboard::EMPTY),
+            tables.quiet_score(Color::BLACK, drop, Bitboard::EMPTY),
             HistoryTables::new().cutoff_bonus(4)
         );
     }
@@ -703,31 +691,19 @@ mod tests {
         let mut tables = history_fixture();
         let rewarded = quiet_move(10, 20, Piece::B_SILVER);
         let penalized = quiet_move(30, 40, Piece::B_GOLD);
-        tables.record_quiet_cutoff(
-            Color::BLACK,
-            rewarded,
-            &[penalized],
-            4,
-            rsshogi::types::Bitboard::EMPTY,
-        );
+        tables.record_quiet_cutoff(Color::BLACK, rewarded, &[penalized], 4, Bitboard::EMPTY);
         let bonus = history_fixture().cutoff_bonus(4);
 
         tables.age();
 
-        assert_eq!(
-            tables.quiet_score(Color::BLACK, rewarded, rsshogi::types::Bitboard::EMPTY),
-            bonus / 2
-        );
-        assert_eq!(
-            tables.quiet_score(Color::BLACK, penalized, rsshogi::types::Bitboard::EMPTY),
-            -(bonus / 2)
-        );
+        assert_eq!(tables.quiet_score(Color::BLACK, rewarded, Bitboard::EMPTY), bonus / 2);
+        assert_eq!(tables.quiet_score(Color::BLACK, penalized, Bitboard::EMPTY), -(bonus / 2));
 
         // 何回か半減すればゼロへ収束する。
         for _ in 0..16 {
             tables.age();
         }
-        assert_eq!(tables.quiet_score(Color::BLACK, rewarded, rsshogi::types::Bitboard::EMPTY), 0);
-        assert_eq!(tables.quiet_score(Color::BLACK, penalized, rsshogi::types::Bitboard::EMPTY), 0);
+        assert_eq!(tables.quiet_score(Color::BLACK, rewarded, Bitboard::EMPTY), 0);
+        assert_eq!(tables.quiet_score(Color::BLACK, penalized, Bitboard::EMPTY), 0);
     }
 }

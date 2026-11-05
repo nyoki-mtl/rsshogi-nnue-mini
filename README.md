@@ -7,7 +7,7 @@
 
 評価関数が約3MBと軽量でMITライセンスのため、WASMやアプリ埋め込みにも適した設計になっています。
 
-[ダウンロード（v0.3.0）](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/v0.3.0) / [使い方](docs/book/src/getting-started.md) / [アプリへの組み込み](docs/book/src/embedding.md)
+[ダウンロード（v0.4.0）](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/v0.4.0) / [使い方](docs/book/src/getting-started.md) / [アプリへの組み込み](docs/book/src/embedding.md)
 配布バイナリは評価関数を内蔵しており、別のモデルファイルは不要です。
 
 ## ライセンス

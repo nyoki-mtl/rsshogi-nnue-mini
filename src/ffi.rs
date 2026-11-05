@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{Engine, SearchOptions, StopHandle};
+use crate::position::MAX_SEARCH_DEPTH;
 
 const MAX_BUFFER: usize = 64 * 1024 * 1024;
 
@@ -143,8 +144,11 @@ fn dispatch(engine: &mut Engine, request: Request) -> Result<Value, String> {
             if depth.is_none() && nodes.is_none() && movetime_ms.is_none() {
                 return Err("search requires depth, nodes or movetime_ms".to_owned());
             }
-            let result =
-                engine.search(SearchOptions { depth: depth.unwrap_or(64), nodes, movetime_ms })?;
+            let result = engine.search(SearchOptions {
+                depth: depth.unwrap_or(MAX_SEARCH_DEPTH),
+                nodes,
+                movetime_ms,
+            })?;
             Ok(json!({"ok": true, "result": result}))
         }
     }
@@ -210,6 +214,77 @@ mod tests {
             assert_eq!(request(handle, r#"{"command":"search","depth":2}"#)["result"]["depth"], 0);
             assert_eq!(request(handle, r#"{"command":"search","depth":2}"#)["result"]["depth"], 2);
             assert_eq!(request(std::ptr::null_mut(), "{}")["ok"], false);
+            mini_engine_free(handle);
+        }
+    }
+
+    #[test]
+    fn c_alloc_and_invalid_model_preserve_state() {
+        let handle = mini_engine_new();
+        assert!(!handle.is_null());
+        unsafe {
+            assert!(mini_alloc(0).is_null());
+            assert!(mini_alloc(MAX_BUFFER + 1).is_null());
+            let buf = mini_alloc(32);
+            assert!(!buf.is_null());
+            mini_dealloc(buf, 32);
+
+            let malformed = CString::new("{").unwrap();
+            let raw = mini_engine_request(handle, malformed.as_ptr());
+            let parsed: Value =
+                serde_json::from_str(CStr::from_ptr(raw).to_str().unwrap()).unwrap();
+            mini_string_free(raw);
+            assert_eq!(parsed["ok"], false);
+
+            let null_req = mini_engine_request(handle, std::ptr::null());
+            let parsed: Value =
+                serde_json::from_str(CStr::from_ptr(null_req).to_str().unwrap()).unwrap();
+            mini_string_free(null_req);
+            assert_eq!(parsed["ok"], false);
+            mini_engine_free(handle);
+
+            let engine = Engine::fixture();
+            let baseline = engine.evaluate().unwrap();
+            let stop = engine.stop_handle();
+            let seeded = Box::into_raw(Box::new(MiniEngine { engine: Mutex::new(engine), stop }));
+            let bad = b"invalid replacement";
+            let load_out = mini_engine_load_model(seeded, bad.as_ptr(), bad.len());
+            let load_json: Value =
+                serde_json::from_str(CStr::from_ptr(load_out).to_str().unwrap()).unwrap();
+            mini_string_free(load_out);
+            assert_eq!(load_json["ok"], false);
+            assert_eq!(request(seeded, r#"{"command":"evaluate"}"#)["score"], baseline);
+            mini_engine_free(seeded);
+        }
+    }
+
+    #[test]
+    fn c_concurrent_two_thread_stop_and_recovery() {
+        let engine = Engine::fixture();
+        let stop = engine.stop_handle();
+        let raw_addr =
+            Box::into_raw(Box::new(MiniEngine { engine: Mutex::new(engine), stop: stop.clone() }))
+                as usize;
+        unsafe {
+            let handle = raw_addr as *mut MiniEngine;
+            assert_eq!(
+                request(handle, r#"{"command":"configure","hash_mb":4,"threads":2}"#)["ok"],
+                true
+            );
+            let worker = std::thread::spawn(move || {
+                let ptr = raw_addr as *mut MiniEngine;
+                request(ptr, r#"{"command":"search","depth":64,"movetime_ms":5000}"#)
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !stop.is_searching() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            mini_engine_stop(handle);
+            let cancelled = worker.join().unwrap();
+            assert_eq!(cancelled["ok"], true);
+            assert!(cancelled["result"]["depth"].as_u64().unwrap() < 64);
+            assert_eq!(request(handle, r#"{"command":"search","depth":1}"#)["result"]["depth"], 1);
             mini_engine_free(handle);
         }
     }

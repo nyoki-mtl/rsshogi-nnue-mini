@@ -1,117 +1,94 @@
 # 置換表と千日手
 
-探索木は木ではない。
-手順前後で同じ局面へ合流する経路が無数にあり、素朴な探索は合流のたびに同じ部分木を読み直す。
-**置換表**（transposition table、TT）は局面をkeyにした共有のcacheで、一度読んだ結果を合流してきた別の経路へ再利用させる。
-子局面を作った直後、x86_64では対応するclusterをCPUへ先読みするよう伝える。
-これはメモリ待ちを隠すためのhintで、entryの内容や探索の判断は変えない。
+将棋では、`▲７六歩 △３四歩 ▲２六歩` と進んでも、`▲２六歩 △３四歩 ▲７六歩` と進んでも、まったく同じ盤面・持ち駒・手番に合流します。探索木は見た目上は木構造ですが、局面のつながりとしては合流を含む有向グラフです。
 
-エントリには探索の深さ、点数、点数の性質（`Exact`、`Lower`、`Upper`）、最善手と、求めてあれば生の静的評価を保存する。
-probeで同じkeyのentryが見つかり、保存された深さが今必要な深さ以上なら、PV node以外では性質に応じて点数をそのまま使う。
-PV nodeで打ち切らないのは、打ち切るとPVが途中で切れ、以前の窓で得た値がPV上へそのまま戻ってくるためである。
-深さが足りなくても最善手は使えるので、並べ替えの先頭に置く（[手の並べ替えとSEE](ordering.md)を参照）。
-詰みの点数は「rootからの手数」を含むため、保存時に局面基準へ、取得時に現在の手数基準へ補正する。
+一度調べた局面の探索結果をハッシュ表に記録しておき、別手順から同じ局面に達したときや次の反復深化で再利用する仕組みが、`src/search/tt.rs` の **置換表（Transposition Table: TT）** です。
 
-## 構造と置換
+---
 
-表の実体は固定長の配列で、大きさは`USI_Hash`（既定16 MiB、1〜1024）で決まる。
-同じインデックスに対応する4個のスロットをまとめて、**cluster**と呼ぶ。
-clusterは64バイトで、cache lineの境界に揃えてあるので、一回のprobeが読むメモリは1本のcache lineに収まる。
-各スロットは2個の`AtomicU64`からなる16バイトの領域で、ロックを使わず読み書きする。
-キーの32ビット検証子と指し手を、評価値などのデータとXORで組み合わせて保存し、読み出した検証子が一致しないエントリは捨てる。
-検証子の衝突や同時書き込みによる混在を完全に排除する方式ではない。
-データには評価値、静的評価、深さ、境界の種類、世代のほかに、そのnodeがPV上で読まれたかを示すPVビットを持つ。主探索はこのビットでLMRの縮小を控える。
+## 1. 64バイト境界クラスタと Lock-free 検証
 
-書き込みの優先順位は次のとおりで、新しい探索を始めるたびに世代番号を進める。
+並列探索（Lazy SMP）では複数のワーカースレッドが同時に置換表を読み書きします。アクセスのたびに Mutex でロックを取るとたちまちボトルネックになるため、`TranspositionTable` はロックを使わない **XOR 検証方式（lockless hashing）** を採っています。
 
-1. 同じkeyのentryがあれば、新しい結果が`Exact`か、深さの差が2以内のときに中身を置き換える。新しい結果に最善手が無ければ、保存済みの手を残す。大きく浅いときは世代だけ現在に引き直す
-2. 空きslotがあれば使う
-3. どちらも埋まっていれば、「深さ − 2 × 世代の古さ」が最も小さいentryを追い出し、新しい結果を必ず保存する
+### クラスタとスロットのメモリ配置
 
-深い探索の結果は再現に費用がかかっているので、浅い結果より生き残らせる。
-一方、何世代も前のentryは深くても参照される見込みが薄いので、世代が進むほど浅いものとして扱う。
-新しい結果を捨てないのは、同じ局面を読み直したときに最善手の情報が失われるほうが高くつくためである。
-`usinewgame`は全entryを消去し、`USI_Hash`の変更は表を作り直す。
+表全体は CPU のキャッシュライン長に合わせた **64バイトの `Cluster`（`#[repr(align(64))]`）** の配列です。1クラスタの中に16バイトの `Slot` が4つ並んでおり、1回のメモリアクセスで4候補をまとめて検査できます（x86_64 では子局面へ降りる直前に `_mm_prefetch` でキャッシュへ先読みします）。
 
-## 千日手がkeyを壊す
+各 `Slot` は2つの `AtomicU64`（`guard` と `data`）で構成されています。
 
-ここまでは教科書どおりのTTである。
-将棋固有の問題は、千日手がこの仕組みの前提を壊すところにある。
+- **`data`（64ビット）**：`score (i16)`・`static_eval (i16)`・`depth (u8)`・`bound (2bit)`・`generation (6bit)`・`pv (1bit)` を1ワードに詰めたもの
+- **`keymove`（64ビット）**：上位32ビットに局面キーの検証値 `key_verifier`、下位32ビットに `best_move`（`Move32`）を詰めたもの
+- **保存される `guard`**：`keymove` をそのまま書くのではなく、**`guard = keymove ^ data`** として XOR を取って格納します
 
-TTの前提は「同じ局面なら同じ点数」である。
-しかし千日手の判定は局面だけでは決まらない。
-同じ盤面と持ち駒でも、そこへ至る経路で同一局面を何回数えたか、連続王手が続いているかで、引き分けにも反則負けにもなる。
-局面のhashだけをkeyにすると、経路Aで「千日手、0点」と保存したentryを、千日手ではない経路Bが信じてしまう。
+読み出し（`probe`）のときは `guard` と `data` を `Relaxed` で読み、`keymove = guard ^ data` を復元して上位32ビットが探している局面の `key_verifier` と一致するかを確かめます。もし別スレッドの書き込みと競合して片方だけが新しい値になっていた場合、XOR で復元した検証ビットが壊れて不一致になるため、壊れたデータ（torn read）を誤って採用するのを高確率で防げます。
 
-このエンジンのkeyは、局面のhashに、千日手判定の結果を左右する状態だけを混ぜた指紋を重ねる。
+---
 
-<svg viewBox="0 0 740 200" xmlns="http://www.w3.org/2000/svg" style="max-width: 740px; width: 100%; height: auto; font-family: sans-serif;">
-  <g fill="none" stroke="currentColor" stroke-width="1.3">
-    <rect x="20" y="30" width="200" height="52" rx="6" fill="currentColor" fill-opacity="0.09"/>
-    <rect x="300" y="16" width="420" height="80" rx="6" fill="currentColor" fill-opacity="0.05"/>
-    <rect x="312" y="40" width="120" height="44" rx="4" fill="currentColor" fill-opacity="0.07"/>
-    <rect x="440" y="40" width="130" height="44" rx="4" fill="currentColor" fill-opacity="0.07"/>
-    <rect x="578" y="40" width="130" height="44" rx="4" fill="currentColor" fill-opacity="0.07"/>
-    <rect x="270" y="140" width="200" height="44" rx="6" fill="currentColor" fill-opacity="0.12"/>
-  </g>
-  <g stroke="currentColor" stroke-width="1.3" fill="none">
-    <line x1="120" y1="82" x2="120" y2="162"/>
-    <line x1="120" y1="162" x2="268" y2="162"/>
-    <line x1="510" y1="96" x2="510" y2="120"/>
-    <line x1="510" y1="120" x2="370" y2="120"/>
-    <line x1="370" y1="120" x2="370" y2="138"/>
-  </g>
-  <g fill="currentColor" font-size="13">
-    <text x="120" y="52" text-anchor="middle">局面のhash</text>
-    <text x="120" y="70" text-anchor="middle" font-size="11" opacity="0.75">盤面、持ち駒、手番</text>
-    <text x="510" y="34" text-anchor="middle" font-size="12">千日手判定を左右する状態の指紋</text>
-    <text x="372" y="60" text-anchor="middle" font-size="12">同一局面の回数</text>
-    <text x="372" y="76" text-anchor="middle" font-size="10" opacity="0.75">履歴で数えた回数</text>
-    <text x="505" y="60" text-anchor="middle" font-size="12">判定の種別</text>
-    <text x="505" y="76" text-anchor="middle" font-size="10" opacity="0.75">引き分け・勝ち・負け・優劣</text>
-    <text x="643" y="60" text-anchor="middle" font-size="12">連続王手の長さ</text>
-    <text x="643" y="76" text-anchor="middle" font-size="10" opacity="0.75">両者分</text>
-    <text x="345" y="167" text-anchor="middle" font-size="13">XOR → TT key</text>
-    <text x="480" y="167" font-size="11" opacity="0.75">（手数上限の使用時は手数も混ぜる）</text>
-  </g>
+## 2. 境界の種類（Bound）と詰みスコアの正規化
+
+alpha-beta 探索では多くのノードが途中で打ち切られるため、置換表に入るスコアが常に「真の評価値」とは限りません。そこで3種類の `Bound` を区別して保存します。
+
+| `Bound` | 記録される場面 | 再利用（`tt_cutoff`）できる条件 |
+| --- | --- | --- |
+| `Exact` | 窓 `(alpha, beta)` の内側で最後まで読み切った真の値 | `score` をそのまま返せる |
+| `Lower` | `score >= beta` で beta cutoff した（本当はもっと高いかもしれない下限値） | 現在の窓でも `score >= beta` なら打ち切れる（未満でも `alpha` の引き上げに使える） |
+| `Upper` | どの手も `alpha` を超えなかった（本当はもっと低いかもしれない上限値） | 現在の窓でも `score <= alpha` なら打ち切れる |
+
+主探索（`negamax`）では、記録されている `entry.depth` が現在の残り深さ `depth` 以上であり、かつ**非 PV ノード（`!pv_node`）**であるときに限り `tt_cutoff` で探索を打ち切ります。PV ノードで安易に置換表カットを許すと、読み筋（PV）が途中で途切れたり、後述する経路依存の問題が表面化しやすくなったりするためです（PV ノードでも置換表の `best_move` や `static_eval` 自体は最大限活用します）。
+
+### 詰みスコアの `ply` 正規化（`score_to_tt` / `score_from_tt`）
+
+詰み帯のスコア（絶対値 `>= 31,754`）は「ルートから何手目の詰みか（`MATE - ply`）」で表されています。しかし、別手順でルートから5手目に合流した局面と、7手目に合流した局面とでは `ply` が異なります。
+
+そのため置換表へ書き込むときは **`score_to_tt`** で「この局面からあと何手で詰むか」という相対距離へ変換し（勝ちなら `+ ply`、負けなら `- ply`）、読み出すときに **`score_from_tt`** で現在の `ply` を差し引きしてルート基準のスコアへ戻します。
+
+---
+
+## 3. 3段階の置き換え戦略と `hashfull`
+
+同じクラスタ（4スロット）が埋まったときにどのエントリを残すかは、次の優先順で決まります。
+
+1. **同一局面のスロットがすでにある場合**
+   新しい結果が `Bound::Exact` であるか、`depth + 2 >= stored_depth` を満たすなら内容を上書きします（このとき新しい結果に `best_move` が無ければ、既存の `best_move` を消さずに引き継ぎます）。浅い結果で上書きしない場合も、世代（`generation`）だけは最新に更新して追い出されにくくします。
+2. **空きスロットがある場合**：最初の空きスロットへそのまま書き込みます。
+3. **4スロットすべてが別局面で埋まっている場合**
+   各スロットの「価値」を `stored_depth - 2 * age`（`age` は現在の探索世代との差）で計算し、最も古く浅いスロットを選んで置き換えます。
+
+なお USI の `info hashfull` は、表全体を走査するコストを避けるため、先頭最大1,000クラスタ（4,000スロット）だけをサンプル調査し、「現在と同じ `generation` を持つ使用中スロットの割合」を千分率（`0..=1000`）で返しています。
+
+---
+
+## 4. 将棋特有の課題：千日手と置換表キー（`tt_key`）
+
+チェスに比べ、持ち駒を再利用できる将棋では同一局面への合流や千日手が頻繁に起こります。ここで素朴に「盤面＋持ち駒＋手番」だけの Zobrist ハッシュを置換表のキーにすると、深刻な誤判定が生じます。
+
+<svg viewBox="0 0 700 185" width="100%" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="同じ盤面でも経路によって千日手状態が異なる例">
+  <rect x="10" y="10" width="680" height="165" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <rect x="28" y="32" width="250" height="50" rx="7" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="153" y="53" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">経路1：普通の駒組みから到達</text>
+  <text x="153" y="71" text-anchor="middle" font-size="11" fill="#334155">出現1回目 / 連続王手 0回</text>
+  <rect x="28" y="102" width="250" height="50" rx="7" fill="#fff1f2" stroke="#e11d48" stroke-width="1.5"/>
+  <text x="153" y="123" text-anchor="middle" font-size="12" font-weight="bold" fill="#881337">経路2：王手を繰り返して到達</text>
+  <text x="153" y="141" text-anchor="middle" font-size="11" fill="#334155">出現3回目 / 連続王手 3回 (次は反則負け)</text>
+  <rect x="330" y="54" width="145" height="76" rx="7" fill="#ffffff" stroke="#64748b" stroke-width="1.5"/>
+  <text x="402" y="82" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e293b">盤面・持駒・手番は</text>
+  <text x="402" y="102" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e293b">まったく同一</text>
+  <rect x="515" y="42" width="155" height="100" rx="7" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="592" y="66" text-anchor="middle" font-size="12" font-weight="bold" fill="#14532d">tt_key の解決策</text>
+  <text x="592" y="86" text-anchor="middle" font-size="11" fill="#334155">Zobrist キーに</text>
+  <text x="592" y="103" text-anchor="middle" font-size="11" fill="#334155">反復回数・種別・連続王手</text>
+  <text x="592" y="120" text-anchor="middle" font-size="11" fill="#334155">を混ぜて別エントリ化</text>
+  <line x1="278" y1="57" x2="328" y2="80" stroke="#3b82f6" stroke-width="1.5"/>
+  <line x1="278" y1="127" x2="328" y2="104" stroke="#e11d48" stroke-width="1.5"/>
+  <line x1="475" y1="92" x2="513" y2="92" stroke="#16a34a" stroke-width="1.5"/>
 </svg>
 
-`rsshogi`の千日手判定は、直前のnull move（無ければ対局開始）まで履歴を遡り、その局面で同一局面の回数と判定の種別を決める。
-keyへ入れるのは、この回数と種別、連続王手の長さである。
-探索plyは入れない。rootが2手進んだ次の`go`でも、同じ局面は同じentryを引ける。
-`MaxMovesToDraw`を使う対局では、手数上限と現在の手数も混ぜる。
+そこで `src/search/context.rs` の `tt_key` では、`rsshogi` が持つ盤面ハッシュ（`position.key().low_u64()`）に対して、経路上の状態を FNV-1a ハッシュで折り畳んで XOR しています。
 
-一方で、その窓の中身、つまりどの経路でこの局面へ来たかはkeyへ入れない。
-経路を入れると手順前後で合流した同一局面が別entryになり、TTがtranspositionを共有できなくなって存在意義を失うからである。
-代わりに、祖先の集合が違う二つの経路が同じentryを共有し得るという**graph history interaction**（GHI）を受け入れる。
-履歴の要約を加えても経路全体を区別できるわけではなく、GHIを完全に防ぐものではない。
-rootにすでに成立している千日手は、TTを見る前に判定する。
+- その局面の過去の反復出現回数（`repetition_times`）と反復種別（通常・連続王手・優等・劣等）
+- 先手・後手それぞれの連続王手回数（`continuous_checks`）
+- `MaxMovesToDraw` が有効な（`> 0`）対局に限り、設定上限値と現在の対局手数（`game_ply`）
 
-## 保存する値の条件
+一方、ルートからの探索段数 `ply` はキーに含めません。`ply` を入れないことで、前の `go` や浅い深さで蓄えたエントリを次の探索でもそのままヒットさせることができます。
 
-主探索は、beta cutoffした結果を`Lower`、窓内でalphaを上げた結果を`Exact`、alphaを上げられなかった結果を`Upper`として保存する。
-この境界の種類は実際に行った探索の窓に対する分類であり、枝刈りや縮小を省いた全幅minimax値への厳密な保証ではない。
-alphaを上げられなかったノードは、読んだ手の最善値をそのまま返して保存する（fail-soft）。
-置換表に無い局面がreverse futility pruningで打ち切られたときも、返した値をその深さの`Lower`として保存する（[reverse futilityとfutility](pruning.md#reverse-futilityとfutility)を参照）。
-
-[静止探索](qsearch.md)は全てのノードで深さを問わずエントリを参照し、保存時には深さ0を付ける。
-枝刈り後にcutoffしなかった結果は保存しない。
-生の静的評価は両探索で再利用し、correction historyの補正を利用時に加える。
-
-## 使用率の観測
-
-USIの`info`には、置換表の現世代の使用率を**hashfull**として千分率で出す。
-先頭の最大1000 clusterを読み、現世代に属する使用slotの割合を`0..=1000`で示す。
-全容量を走査する正確な使用率ではなく、並行更新中の概算である。
-旧世代のentryが残っていても、現世代の使用率には数えない。
-世代は6bitで循環するため、一周以上残ったentryを古さで区別することはできない。
-
-反復完了時に測定し、最終報告では全補助ワーカーのジョブ完了後に測り直す。
-この観測でentryの世代や内容を書き換えることはない。
-TTのhit数とcutoff数は、既存の`stats` featureで別に確認できる。
-
-## 参考資料
-
-- [Chess Programming Wiki: Transposition Table](https://www.chessprogramming.org/Transposition_Table)
-- [Chess Programming Wiki: Zobrist Hashing](https://www.chessprogramming.org/Zobrist_Hashing)
-- [Chess Programming Wiki: Graph History Interaction](https://www.chessprogramming.org/Graph_History_Interaction)
+> **GHI（Graph History Interaction）とのトレードオフ**：`tt_key` は「その局面に到達した時点の反復状態」を区別しますが、「その局面の先でどの祖先局面を踏むと千日手になるか」という未来の履歴までは完全には表現できません。PV ノードで置換表による即座の打ち切り（`tt_cutoff`）を禁止しているのは、本筋の読みにおいてこの経路依存の誤差が直接最善手を歪めるのを抑える役割も兼ねています。

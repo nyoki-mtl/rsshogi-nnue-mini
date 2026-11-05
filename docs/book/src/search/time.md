@@ -1,110 +1,77 @@
-# 時間管理
+# 時間管理と先読み
 
-時間切れは反則負けである。
-そのため、一手に使う時間から安全余裕を引き、探索中も締切を確認する。
-停止確認は協調的に行うので、OSの待ち時間や一回の評価にかかる時間まで含めた厳密な応答期限を保証するものではない。
+対局時計がある実戦では、「残り時間を使い切って時間切れ負けになること」も「時間を余らせすぎて浅い読みで悪手を指すこと」も避けなければなりません。また、評価値が急に落ち込んだ危険な局面では普段より時間を使ってでも最善の受けを探す必要があります。
 
-## 予算の作り方
+持ち時間パラメータからの予算計算は `src/usi/go_time.rs`、探索中の締切判定と動的な伸縮は `src/search/time.rs` が担当しています。
 
-`go`の時間指定から、この一手に使う**予算**を作る。
+---
+
+## 1. 持ち時間からの基準予算の算出（`budget_from_go`）
+
+USI の `go` コマンドで手番側の持ち時間（`btime` / `wtime`）、フィッシャー増秒（`binc` / `winc`）、秒読み（`byoyomi`）、残り手数目安（`movestogo`、省略時は `30` 手と仮定）が渡されると、まず1手あたりの基準予算 `budget` を計算します。
 
 ```text
-配分 = 残り時間 ÷ 配分手数 + 増秒 + 秒読み
-上限適用後 = min(配分, 残り時間 + 秒読み)
-安全余裕 = min(MoveOverhead, 上限適用後 ÷ 2)
-予算 = max(上限適用後 − 安全余裕, 1 ms)
+raw_budget = 残り時間 / movestogo(30) + 増秒(inc) + 秒読み(byoyomi)
 ```
 
-配分手数の既定値は30で、`movestogo`が指定されていればその値を使う（最低1）。
-残り時間をこの手数で割り、着手ごとに戻る増秒と秒読みを上乗せする。
-ただし、この一手で物理的に使えるのは残り時間と秒読みの和までで、配分がそれを超えるなら上限で頭打ちにする。
-増秒を上限に数えないのは、増秒が着手を終えてから加算されるためである。
-`btime 0 binc 2000`を「2秒使える」と読むと、実際には残高0で時間切れ負けになる。
+1. **実残時間による上限クリップ**：フィッシャー増秒は手を指し終えた後に加算されるため、手元の時計を超える時間を使わないよう `残り時間 + 秒読み` を上限として頭打ちにします。
+2. **通信安全余裕（`MoveOverhead`）の差し引き**：GUI とのプロセス間通信や OS スケジューリングの遅れで時間切れになるのを防ぐため、`MoveOverhead`（既定 `500 ms`、ただし予算が極端に短いときは `budget / 2` まで）を差し引き、最低 `1 ms` を保証します。
 
-**安全余裕**（`MoveOverhead`、既定500 ms）は、GUIや中継との往復遅延のために予算から引く。
-引く量は予算の半分を超えないので、短い秒読みでも思考時間が半分は残る。
-`movetime`が指定されたときは配分を行わず、その値から安全余裕を引いた全額を予算にする。
-手番側の残り時間が省略され、秒読みか増秒だけがある場合は、その和から安全余裕を引く。
-残り時間の省略と、明示的な残り時間0は区別する。
-`go infinite`では時間予算を設けない。
+---
 
-## 二段の締切と伸縮
+## 2. Soft 締切と Hard 締切の二段階制御
 
-予算から締切を二つ作る。
+算出した `budget` に対し、通常の持ち時間対局では性質の異なる2つの締切を設定します（`movetime` 固定時間探索や、持ち時間0で毎手一定の `byoyomi` だけで指す状態では、延長の余地がないため `soft = hard = budget` になります）。
 
-<svg viewBox="0 0 740 190" xmlns="http://www.w3.org/2000/svg" style="max-width: 740px; width: 100%; height: auto; font-family: sans-serif;">
-  <defs>
-    <marker id="arrow-tm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
-    </marker>
-  </defs>
-  <rect x="60" y="52" width="150" height="18" fill="currentColor" fill-opacity="0.12" stroke="none"/>
-  <rect x="210" y="52" width="170" height="18" fill="currentColor" fill-opacity="0.07" stroke="none"/>
-  <rect x="380" y="52" width="300" height="18" fill="currentColor" fill-opacity="0.03" stroke="none"/>
-  <g stroke="currentColor" stroke-width="1.5" fill="none">
-    <line x1="40" y1="61" x2="710" y2="61" marker-end="url(#arrow-tm)"/>
-    <line x1="60" y1="45" x2="60" y2="77"/>
-    <line x1="210" y1="45" x2="210" y2="77"/>
-    <line x1="680" y1="45" x2="680" y2="77"/>
-  </g>
-  <g stroke="currentColor" stroke-width="1.2" fill="none" stroke-dasharray="4 3">
-    <line x1="120" y1="84" x2="120" y2="98"/>
-    <line x1="380" y1="84" x2="380" y2="98"/>
-    <line x1="120" y1="91" x2="380" y2="91"/>
-  </g>
-  <g fill="currentColor" font-size="13">
-    <text x="60" y="34" text-anchor="middle">go</text>
-    <text x="210" y="34" text-anchor="middle">soft（予算の60%）</text>
-    <text x="680" y="34" text-anchor="middle">hard（予算の最大3倍）</text>
-    <text x="250" y="118" text-anchor="middle" font-size="12">softは局面に応じて0.4〜2.5倍に伸縮する</text>
-    <text x="370" y="148" text-anchor="middle" font-size="12">最善手が揺れる・評価値が下がる → 伸ばす　同じ最善手が続く → 縮める</text>
-    <text x="370" y="176" text-anchor="middle" font-size="11" opacity="0.75">movetimeと純秒読みでは soft = hard = 予算（伸縮も延長もしない）</text>
-  </g>
+<svg viewBox="0 0 700 150" width="100%" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Soft締切とHard締切の二段階タイムライン">
+  <rect x="10" y="10" width="680" height="130" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <line x1="45" y1="74" x2="655" y2="74" stroke="#94a3b8" stroke-width="4" stroke-linecap="round"/>
+  <rect x="45" y="68" width="235" height="12" rx="6" fill="#3b82f6"/>
+  <rect x="280" y="68" width="265" height="12" rx="0" fill="#f59e0b"/>
+  <rect x="545" y="68" width="110" height="12" rx="6" fill="#ef4444"/>
+  <circle cx="45" cy="74" r="6" fill="#1e3a8a"/>
+  <text x="45" y="48" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">探索開始 (0 ms)</text>
+  <line x1="280" y1="32" x2="280" y2="112" stroke="#d97706" stroke-width="2" stroke-dasharray="4 3"/>
+  <text x="280" y="27" text-anchor="middle" font-size="12" font-weight="bold" fill="#b45309">Soft 締切 (基準 budget × 60% × 係数)</text>
+  <text x="280" y="126" text-anchor="middle" font-size="11" fill="#475569">反復深化の区切りで確認：超えていれば次の深さへ入らない</text>
+  <line x1="545" y1="32" x2="545" y2="112" stroke="#dc2626" stroke-width="2"/>
+  <text x="545" y="27" text-anchor="middle" font-size="12" font-weight="bold" fill="#b91c1c">Hard 締切 (最大 budget × 300%)</text>
+  <text x="545" y="126" text-anchor="middle" font-size="11" fill="#be123c">探索途中でも強制中断</text>
 </svg>
 
-**hard deadline**は各ノードの入口などで確認し、到達を検知したら探索を止める。
-持ち時間があるときは、予算の3倍までhardを延ばす。
-ただし、残り時間の1/4と秒読みの和を超えず、この一手で物理的に使える量（残り時間と秒読みの和）からも安全余裕を引く。
-延長で持ち時間を使い込み、後半の手が即指しになるのを防ぐためである。
+- **Soft 締切（基準値：`budget` の `60%`、`time_soft_permille = 600`）**
+  反復深化で1つの深さ（`depth`）が完了した瞬間にだけチェックする目安ラインです。すでに次の深さを丸ごと読み切るほどの余裕はない場合に、キリよく今の深さで探索を終えて持ち時間を温存します。
+- **Hard 締切（上限：`budget` の `300%`、かつ `残り時間 / 4 + 秒読み` から `MoveOverhead` を引いた値以下）**
+  探索木の真っ最中（`SearchContext::enter_node`）でチェックする絶対上限です。ある深さの途中で想定外に探索木が膨らんだ場合でも、この時刻を過ぎたら直ちに探索を打ち切って時間切れを防ぎます。
 
-**soft deadline**は予算の60%の位置を基準にし、これを過ぎたら新しいiterationを始めない。
-softを設ける理由は、反復深化の費用構造にある。
-深い反復ほど多くの探索が必要になり、残り予算が少ない時点で始めた反復は完了する前にhardへ達しやすい。
+---
 
-softの位置は、iterationを終えるたびに結果を見て伸縮する。
+## 3. 局面の揺れに応じた Soft 締切の伸縮（`IterationTiming`）
 
-- 最善手が前のiterationから変わると伸ばす。変化の回数はiterationごとに半分へ減衰させて数えるので、最近の揺れほど強く効く。
-- 評価値が過去のiterationの平均より下がると伸ばす。悪くなりつつある局面で浅い結論のまま指すと、取り返しがつかないことが多い。
-- 同じ最善手が続くほど縮める。次のiterationで結論が変わりにくいので、節約した時間を揺れている局面へ回せる。
-- 合法手が1つしかなければ、最初のiterationを終えた時点で指す。
+すべての局面で一律に `budget` の60%で切り上げるのではなく、反復深化が進むごとの「最善手の安定度」と「評価値の推移」から倍率 `scale`（`0.4`〜`2.5` 倍）を計算し、Soft 締切を動的に伸縮させます。
 
-伸縮率は0.4倍から2.5倍に収め、hardを越えることはない。
+- **時間を短く切り上げるケース**
+  - **合法手が1手しかない局面**：そもそも迷う余地がないため `scale = 0.0` とし、`depth = 1` が完了した時点で即座に指し手を返します。
+  - **同じ最善手が何反復も連続して変わらない局面**：読みが安定していると判断し、連続安定回数1回につき `-0.07` ずつ倍率を下げて（下限 `0.4` 倍）持ち時間を節約します。
+- **時間を延ばして粘るケース**
+  - **深さが進むたびに最善手が入れ替わる局面**：減衰つきの変化カウンタ `changes` に応じて倍率を `+0.6 × changes` 引き上げ、見落としが起きやすい途中で打ち切るのを避けます。
+  - **前回の深さより評価値が大きく下落した局面**：300点（`time_falling_span = 300`）下がるごとに倍率を `+1.0` 引き上げ、切り返しや受けの手がないかを Hard 締切の範囲内で深く探します。
 
-例外が二つある。
-`movetime`はその時間を使えという指示であり、手番側に持ち時間のない純秒読みは残しても次の手へ回せない。
-どちらもsoftとhardを予算と同じ位置に置き、伸縮も延長もしない。
-ただし、深さやノード数の制限などにより、その前に探索を終える場合はある。
+---
 
-softを確認するのは結果を生成するメインワーカーだけで、補助ワーカーは停止まで置換表を埋め続ける（[Lazy SMP](parallel.md)を参照）。
+## 4. 先読み（`ponder` / `ponderhit`）と WebAssembly の時計
 
-## ponderと締切の引き直し
+### `go ponder` から `ponderhit` への切り替え
 
-`go ponder`は相手の手番で走らせる探索なので、`go`の時刻で締切を固定してはならない。
-そうすると、相手が長考しただけで自分の思考時間が失われる。
+相手の思考時間中に予想応手の先を読む **`go ponder`** では、最初は `pondering = true` フラグが立っています。この間はたとえ Soft / Hard 締切の時刻を過ぎても時間切れによる停止を行わず、`stop` または `ponderhit` が届くまで探索を続けます。
 
-締切は「予算」と「起点」を分けて持ち、ponder中は到達判定そのものを保留する。
-`ponderhit`が来たら、その時刻を新しい起点として同じ予算を計り直す。
-締切は探索workerとsessionが同じ実体を共有するatomicなobjectで、起点の差し替えに探索の停止を要しない。
-探索中ならそのまま継続し、すでに完了していれば保留していた結果をその場で公開する。
+相手が予想どおりの手を指して GUI から **`ponderhit`** が届くと、エンジンは探索木や置換表を止めずにそのまま走り続けながら、次の2つをアトミックに更新します。
 
-## 深さ1を完了できない場合
+1. `SearchDeadline::restart()` で探索開始時刻（経過時間0の起点）を「`ponderhit` を受け取った瞬間」へ引き直す
+2. `pondering` フラグを `false` に下ろし、そこからの通常時間管理を有効化する
 
-hard deadlineは探索を途中で止めるので、depth 1すら完了しないことがある。
-その場合でも、[探索](../search.md)で述べたdepth-0のfallback（予約した1 nodeで評価済みのroot child）が必ず残っており、`bestmove`は評価値と対応の取れた合法手になる。
-この仕組みは、通常の停止処理で返す手と評価値を確保するためのものである。
-応答を送るまでの遅延を含めた時間切れの有無は、実際の対局環境で確認する。
+これにより、相手が考えている間に稼いだ探索深さを無駄にせず、自分の持ち時間だけを正確に使い切ることができます。
 
-## 参考資料
+### WebAssembly 環境での時刻取得
 
-- [Chess Programming Wiki: Time Management](https://www.chessprogramming.org/Time_Management)
-- [Chess Programming Wiki: Iterative Deepening](https://www.chessprogramming.org/Iterative_Deepening)
+`wasm32-unknown-unknown` ターゲットでは標準ライブラリの `std::time::Instant::now()` がパニックするため、`src/search/time.rs` ではホスト側の JavaScript が提供する `env.mini_now_ms`（`performance.now()`）をインポートして単調増加ミリ秒時計として利用しています。

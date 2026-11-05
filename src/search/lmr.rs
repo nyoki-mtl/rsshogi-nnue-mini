@@ -4,7 +4,7 @@
 //! 事前計算し、探索loopでは表引きだけを行う。nodeと手の性質による補正は
 //! [`lmr_reduction`]が同じ1/1024段の単位で実行時に加える。
 
-use crate::params::SearchParams;
+use super::params::SearchParams;
 
 /// 深さの表の上限。従来と同じ63へ飽和する。
 const DEPTH_SIZE: usize = 64;

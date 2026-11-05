@@ -1,187 +1,198 @@
 # アプリへの組み込み
 
-標準入出力を使うUSI実行ファイルに加え、ホストアプリから同期的に呼べるRust APIとC ABIを提供する。
-SwiftとJavaScriptのラッパーも同じC ABIを使う。
-探索定数と評価器はUSI版と共通で、アプリ側が実行先とオブジェクトの寿命を管理する。
+`rsshogi-nnue-mini` は、標準入出力で動く USI エンジンとしてだけでなく、アプリケーションやブラウザのプロセス内から直接呼び出せる組み込みライブラリとしても設計されています。
 
-| 用途 | 呼び出し口 | ビルド手順 |
-| --- | --- | --- |
-| Rustアプリ | `rsshogi_nnue_mini::api::Engine` | 通常のRust library |
-| Windowsアプリ | DLL、import library、C header | `scripts/build_sdk.ps1` |
-| iOS実機、iOS Simulator、Apple SiliconのMac | XCFramework、C header、Swiftラッパー | macOS上で`bash scripts/build_apple.sh` |
-| ブラウザ | Wasm、JavaScript、Web Worker | `scripts/build_wasm.ps1` |
+組み込み経路では USI 用の入出力制御（`UsiSession` や `UsiSearchBridge`）を通さず、呼び出し側が用意したワーカースレッドの上で探索・評価コア（`SearchCoordinator` と `Evaluator`）を直接実行します。
 
-Windows x86_64 SDKはUSI版と同じくAVX2対応CPUを必要とし、実行時のCPU判定によるscalarへの切り替えは行わない。
-ARM64ではNEON kernelを選ぶ。
-dot-product命令は実行環境に応じて選択し、対応していないCPUにも一律で強制しない。
-Wasmの評価kernelはscalarで、内部の探索スレッド数は1に固定する。
+## 組み込みインターフェース一覧
 
-WindowsとWasmは学習済みモデルを使った実行確認を行っている。
-Apple向けは2026年11月2日の候補をM4のMacでビルドし、macOSとiOS SimulatorからSwift 6経由の実モデル評価、探索、停止と終了を確認した。
-配布用static libraryの組み込みモデルdigestと3局面の固定深さ探索もWindows版に一致した。
-iOS実機とIntel Macは未検証であり、棋力や速度の同等性を示す確認ではない。
-公開物の対応環境は、そのリリースで実行確認した範囲を参照する。
-sourceを変更した公開候補は、改めて対象環境でビルドと実行を確認する。
+用途やターゲット環境に応じて4つのレイヤーを用意しています。
 
-## モデルを含めてビルドする
+| 対象 | インターフェース | 実装場所 | 特徴 |
+| --- | --- | --- | --- |
+| Rust アプリ | `rsshogi_nnue_mini::api::Engine` | `src/api.rs` | 型付きの同期メソッド。別スレッドからの停止用に `StopHandle` を分離 |
+| C / 他言語 FFI | `mini_engine_*`（C ABI） | `src/ffi.rs`<br>`bindings/apple/include/rsshogi_nnue_mini.h` | `--features c-api` で有効化。不透明ハンドルと JSON 文字列でやり取り |
+| iOS / macOS（Swift） | `MiniEngine` クラス / `MiniEngine.xcframework` | `bindings/apple/MiniEngine.swift` | C ABI を包む Swift 6 `Sendable` 対応ラッパー。安全な `stop()` / `close()` を提供 |
+| ブラウザ（JavaScript） | Web Worker（`worker.js`） / `MiniEngine`（`mini.js`） | `bindings/wasm/` | 35ms スライスの協調実行で UI や `stop` をブロックしない Web Worker SDK |
 
-モデルを組み込まないビルドでは、生成直後のengineに評価器はない。
-モデルのbytesを`load_model`へ渡してから評価と探索を行う。
-`embedded-rsnn`付きの配布物では`load_embedded`を呼び出せる。
-組み込み時のSHA-256とpackage内の評価仕様、tensor形状、数値範囲を検証する。
-読み込みに失敗した場合は、直前に読み込んでいたモデルを維持する。
+### 共通の仕様と制限
 
-Windows SDKの例を示す。
+どのインターフェースから呼び出した場合も、エンジン内部の契約は共通です。
 
-```powershell
-$env:RSSHOGI_EMBEDDED_RSNN_PATH = (Resolve-Path 'C:/models/model.rsnn').Path
-$env:RSSHOGI_EMBEDDED_RSNN_SHA256 = (Get-FileHash $env:RSSHOGI_EMBEDDED_RSNN_PATH).Hash.ToLowerInvariant()
-pwsh -NoProfile -File scripts/build_sdk.ps1
-```
+- **モデルの読み込みが必須**：生成直後のエンジンは評価関数を持っていません。評価（`evaluate`）や探索（`search`）を呼ぶ前に、外部の `.rsnn` バイト列を渡す `load_model` か、`--features embedded-rsnn` ビルドの内蔵モデルを読む `load_embedded` を実行してください。
+- **エラー時の状態保全**：不正なモデルデータ・非合法な SFEN や指し手・範囲外の設定値を渡した場合、エラーが返りますが、それまでに読み込まれていたモデルや局面は壊れずにそのまま残ります。
+- **設定値の範囲**：
+  - `hash_mb`（置換表サイズ）：`1..=256` MiB（既定値 `16`）
+  - `threads`（探索スレッド数）：ネイティブ環境では `1..=16`、WebAssembly では `1` のみ（既定値 `1`）
+  - `depth`（最大深さ）：`1..=64`、`nodes` と `movetime_ms` は指定する場合 `1` 以上の正の整数
+- **対局ルールと評価値**：入玉宣言は 27点法（`CSARule27`）、探索パラメータは既定値（`SearchParams::default()`）で動作します。返される `score` は手番側から見た内部スコアで、通常評価は `-31,753..=31,753`、詰みスコアは `±32,000` 基準（`32,000 - ply` など）で表されます。
 
-Wasmはモデルのpathを直接指定する。
+---
 
-```powershell
-pwsh -NoProfile -File scripts/build_wasm.ps1 -ModelPath 'C:/models/model.rsnn'
-```
+## 1. Rust から直接組み込む（`src/api.rs`）
 
-Apple向けはmacOS、Xcodeと次のRust targetを用意する。
+Rust のホストアプリケーションからは、`rsshogi_nnue_mini::api::Engine` をそのまま利用できます。`Engine` のメソッドは同期実行で `&mut self` を取るため、探索は UI スレッドではなくバックグラウンドスレッドで呼び出し、中断したい場合はあらかじめ複製しておいた `StopHandle` を使います。
 
-```sh
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
-export RSSHOGI_EMBEDDED_RSNN_PATH=/path/to/model.rsnn
-export RSSHOGI_EMBEDDED_RSNN_SHA256=$(shasum -a 256 "$RSSHOGI_EMBEDDED_RSNN_PATH" | awk '{print $1}')
-bash scripts/build_apple.sh
-```
+```rust
+use std::thread;
+use std::time::Duration;
+use rsshogi_nnue_mini::api::{Engine, SearchOptions};
 
-実機、Simulator、macOSは別sliceとしてXCFrameworkにまとめる。
-`MiniEngine.swift`をアプリへ追加し、`MiniEngine.xcframework`をリンクする。
-スクリプトはSwift 6の型検査とmacOS上の呼び出し確認も行う。
-`MINI_APPLE_INTEL=1`を指定するとIntelのmacOSとSimulatorも追加する。
-対応するRust targetは別途必要になる。
+fn main() -> Result<(), String> {
+    let mut engine = Engine::new();
 
-このprojectの配布SDKにはモデルをバイナリへ組み込み、単独の`.rsnn`は同梱しない。
-[v0.3.0 Release](https://github.com/nyoki-mtl/rsshogi-nnue-mini/releases/tag/v0.3.0)でWindows AVX2 USI、Windows SDK、Apple SDK、Wasm SDKの4種類のZIPを配布する。
-公開sourceの参照先はReleaseのtagである。
-manifestの`source_revision`はビルド元checkoutの記録で、公開snapshotのcommitとは異なる場合がある。
-`public_source_tag`を公開sourceとの対応に使う。
+    // ファイルから .rsnn を読み込む（embedded-rsnn 有効時は engine.load_embedded()? も可）
+    let model_bytes = std::fs::read("eval/model.rsnn").map_err(|e| e.to_string())?;
+    let digest = engine.load_model(&model_bytes)?;
+    println!("loaded model sha256: {digest}");
 
-## C ABIの呼び出し
+    // 置換表 32 MiB・2 スレッドに設定し、初手 ▲７六歩 の局面をセット
+    engine.configure(Some(32), Some(2))?;
+    engine.set_position("startpos", &["7g7f".to_owned()])?;
+    println!("static eval: {}", engine.evaluate()?);
 
-headerは`include/rsshogi_nnue_mini.h`にある。
-JSON requestを渡す関数は、成功時に`{"ok":true,...}`、通常の入力エラー時に`{"ok":false,"error":"..."}`を返す。
+    // 別スレッドから探索を止められるよう StopHandle を複製しておく
+    let stop_handle = engine.stop_handle();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        stop_handle.stop();
+    });
 
-```c
-#include "rsshogi_nnue_mini.h"
-
-MiniEngine *engine = mini_engine_new();
-/* 実際のアプリではNULLと各JSONのokを確認する。 */
-char *loaded = mini_engine_request(engine, "{\"command\":\"load_embedded\"}");
-mini_string_free(loaded);
-char *result = mini_engine_request(engine, "{\"command\":\"search\",\"depth\":6,\"movetime_ms\":500}");
-/* resultを読み取ってから解放する。 */
-mini_string_free(result);
-mini_engine_free(engine);
-```
-
-主なrequestは次のとおり。
-
-| command | 主な引数 | 応答 |
-| --- | --- | --- |
-| `load_embedded` | なし | `digest` |
-| `set_position` | `sfen`、省略可能な`moves`配列 | `ok` |
-| `configure` | `hash_mb`、`threads` | `ok` |
-| `evaluate` | なし | 手番側から見た`score` |
-| `search` | `depth`、`nodes`、`movetime_ms` | `result` |
-| `new_game` | なし | `ok` |
-
-`sfen`は`startpos`または盤面、手番、持ち駒、手数の4フィールド。
-`moves`を渡すと着手履歴も再生する。
-不正な局面や指し手は拒否し、それまでの局面を変更しない。
-
-探索深さは1〜64、Hashは1〜256MiB、nativeの探索スレッド数は1〜16。
-`nodes`と`movetime_ms`は指定する場合に正の値を使う。
-`search`では少なくとも深さ、node数、持ち時間のいずれかを指定する。
-応答には`bestmove`、`ponder`、`score`、`depth`、`nodes`、`elapsed_ms`、`hashfull`、`pv`を含む。
-`score`は探索内部の整数値で、詰みを示す領域も含む。
-
-通常のrequestはhandleごとに直列化される。
-nativeでは`mini_engine_stop`を別threadから呼べる。
-探索の入口の直前に停止された場合も取りこぼさないよう、待機中のstopは次の探索で一度だけ消費する。
-返された文字列は必ず`mini_string_free`で解放する。
-`mini_engine_free`はstopを含む全呼び出しが戻った後にだけ実行し、以後handleを使わない。
-Rust APIでは同じ役割を`Engine`と複製可能な`StopHandle`が持つ。
-
-## Swift
-
-次の処理は同期的に実行されるため、アプリ側のbackground queueなどで呼び出す。
-
-```swift
-let engine = try MiniEngine()
-defer { engine.close() }
-_ = try engine.loadEmbedded()
-try engine.configure(hashMB: 16, threads: 1)
-try engine.setPosition(moves: ["7g7f", "3c3d"])
-let result = try engine.search(depth: 6, movetimeMS: 500)
-print(result.bestmove)
-```
-
-ラッパーはrequestを直列化し、`stop()`は別queueから呼び出せる。
-`close()`は新たな呼び出しを拒否し、進行中の処理を止めてからhandleを解放する。
-内部のhandleと利用数をlockで保護するため、Swift 6のqueue間でも共有できる。
-`request(_:)`へ渡す呼び出し側の可変オブジェクトを、別queueで同時に変更しない。
-
-## ブラウザ
-
-生成したSDK directoryをHTTP serverから配信し、ES moduleのWorkerを作る。
-
-```javascript
-const engine = new Worker("./worker.js", { type: "module" });
-engine.onmessage = ({ data }) => {
-  if (data.event === "bestmove") console.log(data.result.bestmove);
-};
-const ready = new Promise((resolve, reject) => {
-  const onReady = ({ data }) => {
-    if (data.id !== "init") return;
-    engine.removeEventListener("message", onReady);
-    if (data.ok) resolve();
-    else reject(new Error(data.error));
-  };
-  engine.addEventListener("message", onReady);
-});
-engine.postMessage({ command: "init", id: "init", url: "./rsshogi_nnue_mini.wasm" });
-await ready;
-engine.postMessage({ command: "position", id: "position", sfen: "startpos", moves: [] });
-engine.postMessage({ command: "go", id: "search", depth: 6, movetime_ms: 500 });
-// 停止操作に対応する関数の例。
-function stopSearch() {
-  engine.postMessage({ command: "stop", id: "stop" });
+    // 呼び出しスレッド上で同期探索を実行
+    let output = engine.search(SearchOptions {
+        depth: 20,
+        nodes: None,
+        movetime_ms: Some(1_000),
+    })?;
+    println!("bestmove={} score={} depth={}", output.bestmove, output.score, output.depth);
+    Ok(())
 }
 ```
 
-各応答はrequestの`id`と`command`を返す。
-モデルなしのWasmに独自モデルを読み込む場合は、`init`の`model`に`Uint8Array`を渡す。
-進捗は`event: "info"`、完了は`event: "bestmove"`で、通常のgoとstopに対してbestmoveを一度だけ返す。
-局面変更、新しいgo、破棄によって無効になった探索の結果は返さない。
-`new_game`は次局の初期化、`dispose`はengineの解放に使う。
+`StopHandle::stop()` はロックを取らずにアトミック変数だけを更新します。もしホスト側のタイミング都合で `engine.search(...)` に入る直前に `stop()` が呼ばれていた場合でも、停止要求は消えずに次の `search()` 1回分を即座に打ち切り（最小1ノードのフォールバック手を返し）、`search()` から抜けた時点で自動的にリセットされます。
 
-Workerは35ms以内を目安とする探索を繰り返し、合間に停止要求を受け取る。
-Workerの`go`には正の`movetime_ms`か`nodes`を必ず指定し、`depth`だけの要求は受け付けない。
-同期APIの`search`は`depth`だけでも使える。
-TTと履歴は引き継ぐが、各sliceは別の探索であり、nativeの連続した固定時間探索と同じ手順になるとは限らない。
-`nodes`はslice全体の合計、持ち時間はJavaScriptの待ち時間も含めた予算である。
-深いiterationがsliceに収まらない場合は、その深さへの到達を保証しない。
-Wasm SIMD、共有メモリと複数探索threadを必要としない構成である。
+---
 
-`mini.js`の`MiniEngine.create()`も直接使えるが、その`request()`は同期処理である。
-UIを止めない用途にはWorkerを使う。
+## 2. C ABI と JSON プロトコル（`src/ffi.rs`）
 
-## 実行確認
+`--features c-api` を有効にしてビルドすると、`bindings/apple/include/rsshogi_nnue_mini.h` に対応する C ABI 関数が公開されます。Rust 内部で万一パニックが起きた場合も FFI 境界の `catch_unwind` で捕捉し、エラー JSON として返すため、C 側へ巻き戻しが漏れることはありません。
 
-Windowsでは`check_native.py`でC ABIを、`check_usi_sdk.py`でUSIとSDKの固定深さの結果を照合できる。
-Wasmは`check_wasm.mjs`でNode上の処理を確認する。
-`check_wasm_browser.mjs`はPlaywrightが利用できる検証環境で、実際のブラウザのmodule Worker、停止、古い結果の抑止を確認する。
-Playwrightは配布SDKの実行依存ではない。
+### 公開関数とメモリ管理の規則
 
-公開前には対象OSでモデル読み込み、探索、停止、解放を確認する。
-cross-targetのClippyやコンパイル成功だけを、Apple実機での動作確認や棋力の証拠とは扱わない。
+- `mini_engine_new()` / `mini_engine_free(handle)`：エンジンハンドルの生成と破棄。`mini_engine_free` を呼ぶ際は、`mini_engine_stop` を含むすべての呼び出しが完了している必要があります。
+- `mini_engine_load_model(handle, bytes, len)`：`1..=67,108,864` バイト（最大 64 MiB）の `.rsnn` バッファを読み込みます。バッファは関数呼び出し中だけ借用されます。
+- `mini_engine_request(handle, json_cstr)`：NUL 終端 UTF-8 の JSON コマンドを実行し、結果の JSON 文字列ポインタを返します。
+- `mini_engine_stop(handle)`：実行中の探索へ停止フラグを立てます。この関数だけは、別スレッドで `mini_engine_request`（探索）が実行されている最中でも安全に同時呼び出しできます。
+- `mini_string_free(ptr)`：`mini_engine_load_model` と `mini_engine_request` が返した文字列を解放します（呼び出し側で必ず1回解放してください）。
+- `mini_alloc(len)` / `mini_dealloc(ptr, len)`：主に WebAssembly でホスト側から線形メモリへモデルバイト列や文字列を渡すための転送バッファ確保・解放関数です。
+
+### JSON リクエストの形式
+
+`mini_engine_request` に渡す JSON は `"command"` タグで種類を指定します（未知のフィールドがあるとエラーになります）。
+
+```json
+{"command": "load_embedded"}
+{"command": "configure", "hash_mb": 32, "threads": 2}
+{"command": "new_game"}
+{"command": "set_position", "sfen": "startpos", "moves": ["7g7f", "3c3d"]}
+{"command": "evaluate"}
+{"command": "search", "depth": 12, "movetime_ms": 500}
+```
+
+> **注意**：C ABI の `search` では、呼び出しスレッドの無制限ブロックを防ぐため、`depth`・`nodes`・`movetime_ms` のうち**少なくとも1つ**を指定する必要があります。
+
+応答は成功時に `{"ok": true, ...}`、失敗時に `{"ok": false, "error": "..."}` の形で返ります。`search` 成功時の `"result"` オブジェクトには `bestmove`、`ponder`、`score`、`depth`、`nodes`、`elapsed_ms`、`hashfull`、`pv` が入ります。
+
+---
+
+## 3. Swift / iOS・macOS への組み込み（`bindings/apple/`）
+
+Release の `apple-sdk.zip` には、静的ライブラリを束ねた `MiniEngine.xcframework` と、薄いラッパークラス `MiniEngine.swift` が同梱されています。手元の Mac（Xcode と Rust ツールチェーンが必要）で `.rsnn` モデルから再ビルドする場合は次のスクリプトを実行します。
+
+```sh
+# arm64（macOS + iOS Simulator + iOS デバイス向けスライス）をビルド
+./scripts/build_apple.sh /path/to/model.rsnn
+
+# Intel Mac（x86_64）向けスライスも含める場合
+MINI_APPLE_INTEL=1 ./scripts/build_apple.sh /path/to/model.rsnn
+```
+
+Xcode プロジェクトに `MiniEngine.xcframework` と `MiniEngine.swift` を追加すると、次のように呼び出せます。
+
+```swift
+let engine = try MiniEngine()
+_ = try engine.loadEmbedded() // 外部ファイルの場合は try engine.loadModel(data)
+try engine.configure(hashMB: 32, threads: 2)
+try engine.setPosition(sfen: "startpos", moves: ["7g7f"])
+
+// 探索は同期処理のため、UI スレッドではなくバックグラウンドで実行する
+let searchTask = Task.detached {
+    try engine.search(depth: 16, movetimeMS: 500)
+}
+
+// 別スレッドからの中断はロック待ちなしで即座に通る
+// engine.stop()
+
+let result = try await searchTask.value
+print("bestmove: \(result.bestmove), score: \(result.score)")
+
+// 明示的に解放する場合（実行中の処理があれば停止・完了を待ってから解放される）
+engine.close()
+```
+
+`MiniEngine.swift` では、通常のリクエスト直列化に `NSLock` を使いつつ、C ハンドルの生存確認と参照カウントには独立した `NSCondition` を使っています。そのため探索が `NSLock` を握っている最中でも `stop()` は待たされずに実行でき、`close()` を呼んだ際も「新規呼び出しの受付停止 → 停止要求 → 実行中呼び出しの完了待ち → `mini_engine_free`」の順で安全に破棄されます。
+
+> **動作確認の範囲**：Apple SDK は Apple Silicon Mac（macOS arm64）および iOS Simulator（arm64）でテストを実施しています。iOS 実機での署名・動作および Intel Mac 実機での動作は未検証です。
+
+---
+
+## 4. WebAssembly / ブラウザへの組み込み（`bindings/wasm/`）
+
+Release の `wasm-sdk.zip` には、モデル内蔵の `.wasm` バイナリ、線形メモリと JSON 変換を担当する `mini.js`、そしてブラウザのメインスレッドを止めずに探索を回す Web Worker スクリプト `worker.js` が入っています。手元でビルドする場合は `wasm32-unknown-unknown` ターゲットを追加してスクリプトを実行します。
+
+```powershell
+rustup target add wasm32-unknown-unknown
+pwsh -NoProfile -File scripts/build_wasm.ps1 -ModelPath "C:\path\to\model.rsnn"
+```
+
+### Web Worker からの利用例
+
+ブラウザアプリからは `worker.js` を Module Worker として起動し、`postMessage` でコマンドを送るのが標準的な使い方です。
+
+```javascript
+const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+
+worker.onmessage = ({ data }) => {
+  if (!data.ok) {
+    console.error("engine error:", data.error);
+    return;
+  }
+  if (data.event === "info") {
+    console.log(`depth=${data.result.depth} score=${data.result.score} pv=${data.result.pv.join(" ")}`);
+  } else if (data.event === "bestmove") {
+    console.log("bestmove:", data.result.bestmove);
+  }
+};
+
+// 1. 初期化（内蔵モデルの代わりに外部 Uint8Array を使う場合は model プロパティを渡す）
+worker.postMessage({ id: 1, command: "init", url: "./rsshogi_nnue_mini.wasm", hash_mb: 16 });
+
+// 2. 局面設定と探索開始（Worker の go には movetime_ms または nodes が必須）
+worker.postMessage({ id: 2, command: "position", sfen: "startpos", moves: ["7g7f"] });
+worker.postMessage({ id: 3, command: "go", depth: 20, movetime_ms: 1000 });
+
+// 途中で打ち切る場合: worker.postMessage({ id: 4, command: "stop" });
+```
+
+### 35ms スライスによる協調探索の仕組み
+
+シングルスレッドの WebAssembly には OS スレッドがないため、1回の長い `search` をそのまま走らせると、探索が終わるまで Worker のメッセージキューが詰まり `stop` を受け取れなくなってしまいます。
+
+そこで `worker.js` では、目標の `movetime_ms` や `nodes` に達するまで、**1回あたり最大 `35ms` の短い探索スライス**を `setTimeout(..., 0)` を挟みながら段階的に深さを上げて繰り返します。
+
+- 各スライスが終わるたびに `event: "info"` を返し、目標到達または `stop` 受信時に `event: "bestmove"` をちょうど1回だけ返します。
+- スライスを有限時間で区切る必要があるため、Worker の `go` では **`movetime_ms` または `nodes` の指定が必須**です（`depth` 単独指定はエラーになります。なお、`mini.js` の `MiniEngine` クラスを直接同期呼び出しする場合は `depth` 単独指定も可能です）。
+- 各スライスの間で置換表と学習履歴はそのまま引き継がれますが、反復深化を細切れに再開する協調動作であるため、ネイティブ環境で1回の連続探索を行った場合と探索木やノード数が完全に一致するわけではありません。
+- 探索中に新しい `position`・`new_game`・`go`・`dispose` が届いた場合は内部の `generation` カウンタが進み、古いスライスの結果が遅れて `bestmove` として送出されるのを防ぎます。
+
+手元で SDK のスモークテストを実行する場合は、Wasm ビルド後に `node tests/wasm_smoke.mjs dist/wasm/rsshogi_nnue_mini.wasm` を、macOS 上の Apple SDK ビルド後には `bindings/apple` ディレクトリで `swift test` を利用できます。

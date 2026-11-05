@@ -12,14 +12,16 @@ use crate::position::SearchPositionExt;
 use std::cmp::Reverse;
 
 use rsshogi::board::{Captures, Move32List, MoveGenType, Position, Quiets, generate_moves_move32};
-use rsshogi::types::{Bitboard, Move32, PieceType};
+use rsshogi::types::{Bitboard, Move32, Piece, PieceType};
 
 use crate::eval::EvalParams;
-use crate::params::SearchParams;
-use crate::see::static_exchange_eval;
 
 use super::CaptureSee;
-use super::history::{CONTINUATION_PLIES, ContinuationRows, HistoryTables, piece_to_index};
+use super::history::{
+    CONTINUATION_PLIES, ContinuationRows, HistoryTables, piece_to_index, threatened_squares,
+};
+use super::params::SearchParams;
+use super::see::{static_exchange_eval, static_exchange_ge};
 
 /// 並べ替え・縮小・枝刈りで静かな手として扱うか。
 ///
@@ -41,30 +43,36 @@ fn scaled_continuation(score: i32, weight: i32) -> i32 {
 }
 
 /// 取り出し済みの一手と、その手について確定した分類。
-///
-/// `gives_check`は持たない。必要な手だけ探索側が遅延計算する。
 #[derive(Clone, Copy)]
 pub(super) struct OrderedMove {
     pub(super) mv: Move32,
     pub(super) metadata: MoveFacts,
     pub(super) see: CaptureSee,
     pub(super) quiet: bool,
+    /// 非quiet手は並べ替え時に王手判定を済ませているため、静止探索が再利用する。
+    pub(super) known_check: Option<bool>,
     /// 静かな手の履歴スコア。LMRの補正が再計算せずに使う。quiet以外は0。
     pub(super) history_score: i32,
 }
+
+const FLAG_QUIET: u8 = 1 << 0;
+const FLAG_PRINCIPAL: u8 = 1 << 1;
+const FLAG_CHECK_KNOWN: u8 = 1 << 2;
+const FLAG_GIVES_CHECK: u8 = 1 << 3;
+const SEE_NONE: i16 = i16::MIN;
 
 /// 初期スコア付けを終えた一手。SEEは取り出し時まで未計算。
 #[derive(Clone, Copy)]
 struct ScoredMove {
     score: i32,
     mv: Move32,
-    metadata: MoveFacts,
-    quiet: bool,
     history_score: i32,
-    see: CaptureSee,
-    principal: bool,
+    see_raw: i16,
     /// quietの部分ソートでも、同点の生成順を保つ。
     original_index: u16,
+    after: Piece,
+    captured: PieceType,
+    flags: u8,
 }
 
 /// 上位16手だけを先に並べる。残りは実際に必要になってから並べる。
@@ -79,12 +87,32 @@ fn sort_quiet_prefix(entries: &mut [ScoredMove]) -> usize {
 }
 
 impl ScoredMove {
+    fn set_see(&mut self, see: CaptureSee) {
+        self.see_raw = see.map_or(SEE_NONE, |value| {
+            value.clamp(i32::from(i16::MIN + 1), i32::from(i16::MAX)) as i16
+        });
+    }
+
+    fn see(self) -> CaptureSee {
+        (self.see_raw != SEE_NONE).then_some(i32::from(self.see_raw))
+    }
+
+    fn is_capture(self) -> bool {
+        self.captured != PieceType::NONE
+    }
+
+    fn principal(self) -> bool {
+        self.flags & FLAG_PRINCIPAL != 0
+    }
+
     fn into_ordered(self) -> OrderedMove {
         OrderedMove {
             mv: self.mv,
-            metadata: self.metadata,
-            see: self.see,
-            quiet: self.quiet,
+            metadata: MoveFacts::from_parts(self.mv, self.after, self.captured),
+            see: self.see(),
+            quiet: self.flags & FLAG_QUIET != 0,
+            known_check: (self.flags & FLAG_CHECK_KNOWN != 0)
+                .then_some(self.flags & FLAG_GIVES_CHECK != 0),
             history_score: self.history_score,
         }
     }
@@ -114,8 +142,8 @@ pub(super) struct OrderingInputs {
     pub(super) search_params: SearchParams,
     pub(super) killers: [Option<Move32>; 2],
     pub(super) previous: [Option<usize>; CONTINUATION_PLIES],
-    /// 相手の駒が利いているマス。main historyの区分に使う。
-    pub(super) threats: Bitboard,
+    /// 相手の駒が利いているマス。`None`なら静かな手または静かなβカットまで遅延計算する。
+    pub(super) threats: Option<Bitboard>,
     /// 王手回避ではSEEを省き、捕獲を交換損で後回しにしない。
     pub(super) in_check: bool,
 }
@@ -224,17 +252,23 @@ impl MovePicker {
         }
     }
 
+    /// 相手の駒が利いているマスを一度だけ求めてキャッシュする。
+    pub(super) fn threats(&mut self, position: &Position) -> Bitboard {
+        *self.inputs.threats.get_or_insert_with(|| threatened_squares(position))
+    }
+
     /// 静かな手の履歴は「手そのもの」と「直前の手からの続き」の和。
     /// continuationの重みが0なら和はmain historyだけになる。
-    fn history_score(&self, position: &Position, mv: Move32, history: &HistoryTables) -> i32 {
-        history.quiet_score(position.turn(), mv, self.inputs.threats)
+    fn history_score(&mut self, position: &Position, mv: Move32, history: &HistoryTables) -> i32 {
+        let threats = self.threats(position);
+        history.quiet_score(position.turn(), mv, threats)
             + scaled_continuation(
                 history.continuations.score_rows(&self.continuation_rows, piece_to_index(mv)),
                 self.inputs.search_params.continuation_weight,
             )
     }
 
-    fn score(&self, position: &Position, mv: Move32, history: &HistoryTables) -> ScoredMove {
+    fn score(&mut self, position: &Position, mv: Move32, history: &HistoryTables) -> ScoredMove {
         let params = self.inputs.eval_params;
         let killers = self.inputs.killers;
         let metadata = position.move_facts(mv);
@@ -243,11 +277,8 @@ impl MovePicker {
         let promotion = if metadata.is_promotion() { params.promotion_bonus } else { 0 };
         // 王手bonusは捕獲・歩香飛の成りに限定する。静かな手の並べ替えのためだけに
         // 全手の王手判定を払うと、得られる並べ替えの改善より高くつく。
-        let check = if !quiet && position.gives_check_move32(mv) {
-            self.inputs.search_params.check_ordering_bonus
-        } else {
-            0
-        };
+        let gives_check = !quiet && position.gives_check_move32(mv);
+        let check = if gives_check { self.inputs.search_params.check_ordering_bonus } else { 0 };
         let principal = Some(mv) == self.tt_move;
         let history_score = if quiet { self.history_score(position, mv, history) } else { 0 };
         // 静かな手の層はkiller(80_000/70_000)、履歴の順。履歴は±16_384に
@@ -269,15 +300,18 @@ impl MovePicker {
             + promotion
             + check
             + quiet_rank;
+        let flags = (if quiet { FLAG_QUIET } else { FLAG_CHECK_KNOWN })
+            | (if principal { FLAG_PRINCIPAL } else { 0 })
+            | (if gives_check { FLAG_GIVES_CHECK } else { 0 });
         ScoredMove {
             score,
             mv,
-            metadata,
-            quiet,
             history_score,
-            see: None,
-            principal,
+            see_raw: SEE_NONE,
             original_index: 0,
+            after: metadata.piece_after_move(),
+            captured: metadata.captured_piece_type(),
+            flags,
         }
     }
 
@@ -322,6 +356,7 @@ impl MovePicker {
                             metadata,
                             see: None,
                             quiet: is_quiet(metadata),
+                            known_check: None,
                             history_score: 0,
                         });
                     }
@@ -352,12 +387,14 @@ impl MovePicker {
                         continue;
                     }
                     self.yielded_killers[slot] = Some(mv);
+                    let history_score = self.history_score(position, mv, history);
                     return Some(OrderedMove {
                         mv,
                         metadata,
                         see: None,
                         quiet: true,
-                        history_score: self.history_score(position, mv, history),
+                        known_check: None,
+                        history_score,
                     });
                 }
                 Stage::All | Stage::Captures | Stage::Quiets => {
@@ -385,19 +422,25 @@ impl MovePicker {
                     }
                     let mut entry = self.buffer.entries[self.index];
                     self.index += 1;
-                    if entry.metadata.is_capture() && !self.inputs.in_check {
-                        // 捕獲はここで初めてSEEを払う。βカットで届かない手には払わない。
-                        let see = static_exchange_eval(position, entry.mv, self.inputs.eval_params);
-                        entry.see = see;
-                        if !entry.principal
-                            && let Some(exchange) = see
-                            && exchange < 0
-                        {
-                            // 負け捕獲は山へ。旧形式のscore(-class + see)へ置き直して
-                            // 山の中の相対順序を保つ。TT moveは負け捕獲でも先頭のまま。
-                            entry.score = entry.score - 2 * self.capture_class_bonus + exchange;
-                            self.buffer.deferred.push(entry);
-                            continue;
+                    if entry.is_capture() && !self.inputs.in_check {
+                        // 捕獲はここで初めてSEEを払う。まず閾値0で非負かを判定し、
+                        // 負け捕獲と分かった手だけ正確な交換損を求めて山へ回す。
+                        if static_exchange_ge(position, entry.mv, 0, self.inputs.eval_params) {
+                            entry.set_see(Some(0));
+                        } else {
+                            let see =
+                                static_exchange_eval(position, entry.mv, self.inputs.eval_params);
+                            entry.set_see(see);
+                            if !entry.principal()
+                                && let Some(exchange) = see
+                                && exchange < 0
+                            {
+                                // 負け捕獲は山へ。旧形式のscore(-class + see)へ置き直して
+                                // 山の中の相対順序を保つ。TT moveは負け捕獲でも先頭のまま。
+                                entry.score = entry.score - 2 * self.capture_class_bonus + exchange;
+                                self.buffer.deferred.push(entry);
+                                continue;
+                            }
                         }
                     }
                     return Some(entry.into_ordered());
@@ -463,7 +506,7 @@ mod tests {
             search_params: SearchParams::default(),
             killers,
             previous: [None; CONTINUATION_PLIES],
-            threats: Bitboard::EMPTY,
+            threats: Some(Bitboard::EMPTY),
             in_check: false,
         }
     }
@@ -494,7 +537,8 @@ mod tests {
     fn partial_quiet_sort_preserves_the_full_stable_order_including_ties() {
         let position = board::hirate_position();
         let history = HistoryTables::new();
-        let picker = MovePicker::staged(None, test_inputs([None; 2]), OrderingBuffer::default());
+        let mut picker =
+            MovePicker::staged(None, test_inputs([None; 2]), OrderingBuffer::default());
         let mv = board::move_from_usi(&position, "7g7f").unwrap();
         for length in [0, 1, 15, 16, 17, 31, 32, 33, 100, 600] {
             let mut entries: Vec<_> = (0..length)
@@ -529,13 +573,7 @@ mod tests {
         // killerと履歴を負け捕獲に与えても、捕獲の並べ替えには影響しない。
         let mut history = HistoryTables::new();
         for _ in 0..64 {
-            history.record_quiet_cutoff(
-                Color::BLACK,
-                losing_high_victim,
-                &[],
-                13,
-                rsshogi::types::Bitboard::EMPTY,
-            );
+            history.record_quiet_cutoff(Color::BLACK, losing_high_victim, &[], 13, Bitboard::EMPTY);
         }
 
         let ordered =
@@ -587,13 +625,7 @@ mod tests {
         let killer = mv("1i1h");
         let boosted = mv("5e4e");
         let mut history = HistoryTables::new();
-        history.record_quiet_cutoff(
-            Color::BLACK,
-            boosted,
-            &[],
-            13,
-            rsshogi::types::Bitboard::EMPTY,
-        );
+        history.record_quiet_cutoff(Color::BLACK, boosted, &[], 13, Bitboard::EMPTY);
 
         let ordered =
             collect_order(&position, &moves, Some(losing_capture), [Some(killer), None], &history);
@@ -702,5 +734,29 @@ mod tests {
         let largest_unknown_capture = params.bishop * 16 + check_bonus;
 
         assert!(capture_class_bonus(params, check_bonus) > largest_unknown_capture);
+    }
+
+    #[test]
+    fn scored_move_stays_compact_and_computes_threats_lazily() {
+        board::init();
+        assert!(size_of::<ScoredMove>() <= 20, "actual={}", size_of::<ScoredMove>());
+
+        let position = board::position_from_sfen("k8/9/4p4/4s2p1/4R2P1/9/9/9/8K b - 1")
+            .expect("valid position");
+        let tt_mv = board::move_from_usi(&position, "7i6h").expect("legal move");
+        let cap_mv = board::move_from_usi(&position, "2e2d").expect("legal capture");
+        let history = HistoryTables::new();
+        let mut inputs = test_inputs([None; 2]);
+        inputs.threats = None;
+        let mut picker = MovePicker::staged(Some(tt_mv), inputs, OrderingBuffer::default());
+        let first = picker.next(&position, &history).expect("TT move");
+        assert_eq!(first.mv, tt_mv);
+        assert!(picker.inputs.threats.is_none(), "TT move does not compute threats");
+        let second = picker.next(&position, &history).expect("capture move");
+        assert_eq!(second.mv, cap_mv);
+        assert!(picker.inputs.threats.is_none(), "captures do not compute threats");
+        let third = picker.next(&position, &history).expect("quiet move");
+        assert!(third.quiet);
+        assert_eq!(picker.inputs.threats, Some(threatened_squares(&position)));
     }
 }

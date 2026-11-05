@@ -6,15 +6,16 @@ use std::sync::{Arc, mpsc};
 use rsshogi::board::Position;
 
 use crate::eval::{EvalParams, Evaluator};
-use crate::params::SearchParams;
-use crate::tt::TranspositionTable;
 
 use super::context::{SearchContext, SharedSearch};
+use super::coordinator::SearchCoordinator;
 use super::history::HistoryTables;
-use super::{SearchControl, SearchEvent, SearchJob, SearchLimits, SearchResult, run};
+use super::params::SearchParams;
+use super::tt::TranspositionTable;
+use super::{SearchControl, SearchEvent, SearchJob, SearchLimits, SearchResult};
 
 /// 深さだけを制限し、node数・時間・候補手・手数の制限を持たないlimits。
-pub(crate) fn depth_limits(max_depth: u32) -> SearchLimits {
+pub(super) fn depth_limits(max_depth: u32) -> SearchLimits {
     SearchLimits {
         max_depth,
         max_nodes: None,
@@ -24,7 +25,7 @@ pub(crate) fn depth_limits(max_depth: u32) -> SearchLimits {
     }
 }
 
-pub(crate) fn test_context(nodes: Arc<AtomicU64>, max_nodes: Option<u64>) -> SearchContext {
+pub(super) fn test_context(nodes: Arc<AtomicU64>, max_nodes: Option<u64>) -> SearchContext {
     let mut context = SearchContext::new(
         Evaluator::material(EvalParams::default()),
         SearchParams::default(),
@@ -42,7 +43,7 @@ pub(crate) fn test_context(nodes: Arc<AtomicU64>, max_nodes: Option<u64>) -> Sea
 }
 
 /// 駒得評価と既定の探索パラメータで探索するjobと、そのeventの受信側。
-pub(crate) fn material_job(
+pub(super) fn material_job(
     position: Position,
     limits: SearchLimits,
     control: SearchControl,
@@ -61,13 +62,18 @@ pub(crate) fn material_job(
     (job, receiver)
 }
 
-pub(crate) fn idle_control() -> SearchControl {
+pub(super) fn idle_control() -> SearchControl {
     SearchControl::new(Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)))
 }
 
-pub(crate) fn run_result(position: Position, limits: SearchLimits, threads: usize) -> SearchResult {
+pub(super) fn run_job(job: SearchJob) {
+    let mut coordinator = SearchCoordinator::new(job.threads, &job.control);
+    coordinator.run(job, Arc::new(TranspositionTable::new(1)));
+}
+
+pub(super) fn run_result(position: Position, limits: SearchLimits, threads: usize) -> SearchResult {
     let (job, receiver) = material_job(position, limits, idle_control(), threads);
-    run(job, Arc::new(TranspositionTable::new(1)), &mut Vec::new());
+    run_job(job);
     receiver
         .into_iter()
         .find_map(|event| match event {

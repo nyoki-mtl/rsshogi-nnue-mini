@@ -1,7 +1,35 @@
 # はじめに
 
-`rsshogi-nnue-mini`は、[rsshogi](https://github.com/nyoki-mtl/rsshogi)と[rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi)で作ったUSI将棋エンジンです。
-[rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa)でのCSA接続や[ShogiArena](https://github.com/nyoki-mtl/ShogiArena)での対局・調整と組み合わせて使う一例として公開しています。
+`rsshogi-nnue-mini` は、Rust製の将棋ライブラリ群（`rsshogi` エコシステム）を組み合わせて実装した、コンパクトな USI 将棋エンジンです。
 
-使い始めるには[セットアップ](getting-started.md)を参照してください。
-仕組みを知りたい場合は[実行時の構成](architecture.md)、[評価関数](nnue.md)、[探索](search.md)から読めます。
+コード全体を追いかけられる規模（単一クレート・`src/` 配下で約8,000行）に保ちながら、実用的な将棋エンジンに必要な要素を一通り備えています。対局用エンジンやアプリ組み込み用ライブラリとしてそのまま使えるほか、「現代的な NNUE 将棋エンジンがどのように組み立てられているか」をコードと照らし合わせて学ぶ教材としても読めるように設計しています。
+
+## 主な特徴
+
+- **軽量な NNUE 評価関数（約3.26 MB）**：玉を含む各駒を個別に符号化する A-only 特徴量と `i8` 量子化重みを用い、玉移動時の全再計算を不要にしつつ、WebAssembly やモバイル環境にも載せやすいサイズに収めています。
+- **段階的に理解できる探索実装**：反復深化、negamax / PVS、静止探索、lock-free 置換表（千日手情報つきキー）、段階的な手の生成と SEE・履歴ヒューリスティクス、主要な枝刈りと対数 LMR、二段階の時間管理、Lazy SMP による並列探索をモジュールごとに分けて実装しています。
+- **USI 実行ファイルと組み込み SDK の両対応**：将棋 GUI から使う標準入出力ベースの USI エンジンに加え、Rust の同期 API、C ABI、Swift ラッパー（XCFramework）、ブラウザ向け WebAssembly + Web Worker SDK を同じ探索・評価コアから提供します。
+- **MIT ライセンス**：エンジン本体のソースコードおよび配布パッケージは MIT ライセンスで公開しています。
+
+## `rsshogi` エコシステムにおける位置づけ
+
+盤面表現やプロトコル解析などの基盤は専用クレートへ委譲し、このリポジトリは**評価・探索・実行制御**に集中しています。
+
+| プロジェクト | 役割 | このエンジンでの使われ方 |
+| --- | --- | --- |
+| [rsshogi](https://github.com/nyoki-mtl/rsshogi) | 盤面（Bitboard）、合法手生成、SFEN、千日手・入玉判定、1手詰め | `src/position.rs` や探索・評価の各所で直接利用 |
+| [rsshogi-usi](https://github.com/nyoki-mtl/rsshogi-usi) | USI コマンドの型表現、構文解析、文字列整形 | `src/usi/` で入出力のプロトコル処理に利用 |
+| `rsshogi-nnue-mini`（本書） | NNUE 推論・差分更新、ゲーム木探索、USI セッション、組み込み API | 本リポジトリの実装対象 |
+| [rsshogi-csa](https://github.com/nyoki-mtl/rsshogi-csa) | USI エンジンを CSA サーバーへ接続するブリッジ | 外部ツールとして組み合わせて利用 |
+| [ShogiArena](https://github.com/nyoki-mtl/ShogiArena) | エンジン間対局、SPRT 検定、SPSA パラメータ調整、ダッシュボード | `tuning` ビルドと組み合わせて対局・調整に利用 |
+
+## 目的別の読み進め方
+
+目的に応じて、必要なパートから読み進められます。
+
+- **将棋 GUI で対局させたい・手元でビルドしたい**
+  - [セットアップとビルド](getting-started.md) で配布バイナリの導入方法やソースからのビルド手順を確認し、設定の調整には [USIコマンドとオプション](usi.md) を参照してください。
+- **自作アプリやブラウザへ将棋エンジンを組み込みたい**
+  - [アプリへの組み込み](embedding.md) で Rust API・C ABI・Swift（iOS / macOS）・WebAssembly（Web Worker）の呼び出し方法とスレッド・寿命管理の規則を解説しています。
+- **将棋エンジンの設計と実装をコードと合わせて学びたい**
+  - まず [全体構成とコードマップ](architecture.md) でスレッド構成と `src/` のモジュール配置を掴み、続いて [NNUE評価関数](nnue.md) で局面の点数化、[探索の全体像](search.md) 以降の各章で「点数を最善手へ変える仕組み」を順番に追うのがおすすめです。

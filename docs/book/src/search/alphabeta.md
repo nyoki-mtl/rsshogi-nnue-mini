@@ -1,96 +1,82 @@
 # alpha-beta法とPVS
 
-仮に各局面に80手の候補があると、深さ6の全探索は80^6、およそ2.6×10^11局面になる。
-すべての手を同じ深さまで読む方法は現実的ではない。
-探索を深くするには、最善手の判定に不要な枝を早く見つける必要がある。
+合法手が平均80通りほどある将棋では、すべての枝を愚直に読む minimax 法のままでは数手先で局面数が爆発してしまいます。**評価結果（最善手とスコア）を一切変えずに、結果に影響しないことが確定した枝だけを読み飛ばす**基本アルゴリズムが **alpha-beta 法**であり、それをさらに推し進めたのが **PVS（Principal Variation Search）** です。
 
-## negamax
+実装は主に `src/search/negamax.rs`、`src/search/root.rs`、`src/search.rs` にあります。
 
-**negamax**は、「相手にとって良い点数は自分にとって悪い点数」として、最大化と最小化を一つの処理にまとめる方法である。
-各ノードは子局面を`-negamax(child, -beta, -alpha)`で評価し、常に手番側から見た点数だけを扱う。
-以下の呼び出し表記では、深さなどの引数を省略している。
+---
 
-## alpha-betaの窓
+## 1. `(alpha, beta)` 窓と beta cutoff の原理
 
-negamaxの各呼び出しは、**探索窓**`(alpha, beta)`を受け取る。
-alphaは「これを上回る手を探すための下側の境界」、betaは「この値以上と分かれば探索を打ち切れる上側の境界」である。
-祖先から受け継いだ窓や予測で狭めた窓も使うため、alphaが常にこの局面ですでに確保した点数とは限らない。
-子の評価がこの窓のどこに落ちたかで、続きを読むかどうかが決まる。
+negamax 探索の各ノードは、常に **`(alpha, beta)`** という2つの境界値（探索窓）を受け取ります。どちらも「現手番側から見た点数」です。
 
-<svg viewBox="0 0 720 190" xmlns="http://www.w3.org/2000/svg" style="max-width: 720px; width: 100%; height: auto; font-family: sans-serif;">
-  <defs>
-    <marker id="arrow-ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
-    </marker>
-  </defs>
-  <g stroke="currentColor" stroke-width="1.5" fill="none">
-    <line x1="40" y1="90" x2="690" y2="90" marker-end="url(#arrow-ab)"/>
-    <line x1="230" y1="78" x2="230" y2="102"/>
-    <line x1="500" y1="78" x2="500" y2="102"/>
-  </g>
-  <rect x="230" y="82" width="270" height="16" fill="currentColor" fill-opacity="0.12" stroke="none"/>
-  <g fill="currentColor" font-size="13">
-    <text x="230" y="70" text-anchor="middle">alpha</text>
-    <text x="500" y="70" text-anchor="middle">beta</text>
-    <text x="700" y="112" text-anchor="end" font-size="11" opacity="0.75">score →</text>
-    <text x="130" y="130" text-anchor="middle">fail low</text>
-    <text x="130" y="148" text-anchor="middle" font-size="11" opacity="0.75">この手は現状を超えない</text>
-    <text x="130" y="164" text-anchor="middle" font-size="11" opacity="0.75">次の手へ</text>
-    <text x="365" y="130" text-anchor="middle">窓の中</text>
-    <text x="365" y="148" text-anchor="middle" font-size="11" opacity="0.75">新しい最善手</text>
-    <text x="365" y="164" text-anchor="middle" font-size="11" opacity="0.75">alphaを引き上げる</text>
-    <text x="600" y="130" text-anchor="middle">fail high（beta cutoff）</text>
-    <text x="600" y="148" text-anchor="middle" font-size="11" opacity="0.75">相手はこの局面を選ばない</text>
-    <text x="600" y="164" text-anchor="middle" font-size="11" opacity="0.75">残りの手を読まずに打ち切る</text>
-  </g>
+- **`alpha`（確保済みの下限）**：「別の選択肢を選べば、少なくともこの点数以上になることがすでに分かっている」というライン。これ以下の手は選ぶ理由がありません。
+- **`beta`（相手が許す上限）**：「自分の点数が `beta` 以上になるなら、1手前の相手はそもそもこの局面へ進んでこない（別の手を選ぶ）」というライン。
+
+したがって、候補手を順番に調べていく途中で **`score >= beta`** となる手が1つでも見つかった瞬間、「この局面は相手にとって損すぎるため実現しない」と確定し、**残りの候補手を1手も読まずに探索を打ち切る**ことができます。これを **beta cutoff（fail-high）** と呼びます。
+
+<svg viewBox="0 0 700 225" width="100%" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="alpha-beta探索でbeta cutoffが起きる例">
+  <rect x="10" y="10" width="680" height="205" rx="10" fill="#f8fafc" stroke="#cbd5e1"/>
+  <circle cx="350" cy="44" r="22" fill="#eff6ff" stroke="#2563eb" stroke-width="2"/>
+  <text x="350" y="49" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">親</text>
+  <text x="462" y="42" font-size="12" fill="#1e293b">手Aで +120 を確保済み → alpha = +120</text>
+  <text x="462" y="59" font-size="11" fill="#475569">(子ノードへは反転窓 beta = -120 として渡る)</text>
+  <line x1="332" y1="58" x2="180" y2="112" stroke="#2563eb" stroke-width="2"/>
+  <line x1="368" y1="58" x2="500" y2="112" stroke="#475569" stroke-width="2"/>
+  <rect x="115" y="112" width="130" height="44" rx="7" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="180" y="131" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e3a8a">手A の結果</text>
+  <text x="180" y="148" text-anchor="middle" font-size="12" fill="#1e293b">親視点 +120</text>
+  <rect x="430" y="112" width="150" height="44" rx="7" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>
+  <text x="505" y="131" text-anchor="middle" font-size="12" font-weight="bold" fill="#78350f">手B (相手番ノード)</text>
+  <text x="505" y="148" text-anchor="middle" font-size="11" fill="#475569">上限 beta = -120</text>
+  <line x1="470" y1="156" x2="415" y2="186" stroke="#16a34a" stroke-width="2"/>
+  <line x1="505" y1="156" x2="505" y2="186" stroke="#dc2626" stroke-width="1.8" stroke-dasharray="4 3"/>
+  <line x1="540" y1="156" x2="595" y2="186" stroke="#dc2626" stroke-width="1.8" stroke-dasharray="4 3"/>
+  <text x="410" y="203" text-anchor="middle" font-size="12" font-weight="bold" fill="#15803d">応手b1: -50 (≧ -120!)</text>
+  <text x="552" y="203" text-anchor="middle" font-size="12" font-weight="bold" fill="#b91c1c">b2, b3... は読まずに打ち切り (cutoff)</text>
 </svg>
 
-ある手の点数がbeta以上になると、相手は一つ前の分岐でこの局面を選ばない。
-この局面がbetaよりどれだけ良いかは、現在の最善手を決める材料にならない。
-残りの手を読まずに「beta以上」という下界だけを返して打ち切れる。
-これが**beta cutoff**で、alpha-betaの削減はすべてここから生まれる。
+子ノードへ降りるときは手番が入れ替わるため、親の窓 `(alpha, beta)` は符号と上下を入れ替えた **`(-beta, -alpha)`** として渡されます。
 
-削減の量は手の並び順に強く依存する。
-有望な手を先に読むほどalphaとbetaの境界が早く狭まり、後続の枝でcutoffが起きやすくなる。
-最悪の順で読めば、cutoffは一度も起きず全探索と同じになる。
-理想的な並び順なら訪問node数は全探索の平方根近くまで落ちるため、手の順序は探索速度を大きく左右する（[手の並べ替えとSEE](ordering.md)）。
+上の図では、親がすでに手Aで `+120` を確保しています。続く手Bを調べたところ、相手の最初の応手 b1 で相手視点 `-50`（＝親視点 `+50`）になりました。相手にはもっと良い応手（親にとって `+50` よりさらに悪い手）があるかもしれませんが、少なくとも手Bが `+120` に届かないことはこの瞬間に確定します。そのため b2 以降はすべて省略できます。
 
-## PVS：二番目以降の手はまず疑う
+ここから分かるとおり、**最も有力な応手（b1）を最初に並べられるほど早く cutoff が起きる**ため、[手の並べ替え](ordering.md)が探索速度の生命線になります。
 
-並び順が良いという前提を信じるなら、もう一歩進める。
-最初の手が最善で、二番目以降の手はどうせalphaを超えない、と仮定してしまうのである。
+---
 
-**Principal Variation Search（PVS）**は、最初の手だけを通常の窓`(alpha, beta)`で読み、二番目以降の手を最小幅の窓`(alpha, alpha+1)`で読む。
-この**zero-window探索**は「alphaを超えるか超えないか」だけを判定する探索で、窓が狭いぶんcutoffが頻発し、通常の窓よりずっと安い。
+## 2. Principal Variation Search（PVS / ゼロ幅探索）
 
-仮定が当たっている限り、zero-window探索は「超えない」を安く確認して終わる。
-仮定が外れてalphaを超えたときだけ、その手を通常の窓で読み直して正確な点数を得る。
-読み直しは二重の費用だが、並び順が整っていれば発生はまれで、大多数の手が安い確認だけで済む利得のほうが大きい。
-zero-window探索の点数がbeta以上なら読み直しもせず、そのままcutoffになる。
+手の並べ替えが十分に機能しているなら、各ノードで**最初に調べる手（`index == 0`）がそのまま最善手であり、2番目以降の手（`index > 0`）はすべて `alpha` 以下に終わる**可能性が高くなります。
 
-## aspiration window：rootの窓も狭める
+そこで PVS（`src/search/negamax.rs` および `src/search/root.rs`）では、1番目と2番目以降で窓の幅を使い分けます。
 
-反復深化には、もう一つ窓を狭める材料がある。
-前のiterationのscoreである。
-depth 7のscoreがdepth 8で大きく動くことは少ないので、rootの窓を最初から`前回のscore ± aspiration_window`に絞って探索を始める（既定値は88）。
-完了したiteration間のscoreの変化を平滑化し、変化が大きい場合は初期幅をこの値の最大3倍まで広げる。
-scoreが安定すれば幅は基準値へ近づく。
+1. **1番目の手（`index == 0`）**：通常の窓 `(-beta, -alpha)` でしっかり探索し、基準となるスコア `alpha` を確定させます。
+2. **2番目以降の手（`index > 0`）**：「この手はどうせ `alpha` を超えないはずだ」という仮説を立て、幅が1しかない**ゼロ幅窓（null window）`(-alpha - 1, -alpha)`** で軽く検査（scout）します。
+   - **仮説どおり `score <= alpha` だった場合**：正確な点数が何点かを知る必要はないため、そのまま次の手へ進みます。窓が極限まで狭いので、内部で大量の cutoff が起きて高速に終わります。
+   - **仮説が外れて `score > alpha` になった場合**：1番目の手より良い手が見つかった可能性があるため、`score < beta`（ルートでは常に真）であれば本来の広い窓 `(-beta, -alpha)` で**再探索（re-search）**して正確な評価値を求めます。
 
-予測が当たれば、窓の外に出る枝が早く刈れてiteration全体が安くなる。
-外れてscoreが窓の外に落ちたときは、外れた側だけを「外れた値から幅の2倍」の位置まで広げて、そのiterationを読み直す。
-反対側は動かさず、外すたびに幅を倍にするので、何度外しても数回で全幅`(-INF, INF)`に届く。
-この読み直しは完了したiterationに対してだけ行い、打ち切られた途中結果には適用しない。
+コードの中では、`beta - alpha > 1` である本筋のノードを **PV ノード（`pv_node = true`）**、幅1のゼロ幅探索中にあるノードを **非 PV ノード（`zero_window = !pv_node`）** として区別しています。非 PV ノードでは正確な点数の代わりに「閾値を超えるかどうか」だけを判定すればよいため、次章以降の置換表カットや枝刈りもより積極的に適用できます。
 
-## iterationをまたぐ並べ替え
+---
 
-各iterationを読み終えたら、最善手を先頭に置き、残りのroot movesを部分木に費やしたnode数の多い順に並べる。
-多く読まれた手ほど、最善手を覆しかけた有力な手である。
-rootの置換表entryに最善手が残っていれば、それも先頭へ引き上げる。先頭へ動かすときは他の手の順序を保つ。
-PVSもaspirationも「最初の手がおそらく最善」という前提に費用を賭ける方式なので、この並べ替えが前提の当たり率を直接支えている。
+## 3. ルートの Aspiration Window（`src/search.rs`）
 
-## 参考資料
+反復深化の `depth = 1` では手がかりがないため全窓 `(-INF, +INF)` で探索しますが、`depth >= 2` では「1つ前の深さの評価値 `previous_score` から大きくは動かないだろう」と予測できます。
 
-- [Chess Programming Wiki: Alpha-Beta](https://www.chessprogramming.org/Alpha-Beta)
-- [Chess Programming Wiki: Principal Variation Search](https://www.chessprogramming.org/Principal_Variation_Search)
-- [Chess Programming Wiki: Aspiration Windows](https://www.chessprogramming.org/Aspiration_Windows)
-- [Donald E. Knuth and Ronald W. Moore, “An Analysis of Alpha-Beta Pruning”](https://www.sciencedirect.com/science/article/pii/0004370275900193)
+そこでルート探索の初期窓も最初から全窓にはせず、前回の評価値を中心とした狭い **Aspiration Window（期待窓）** から始めます。
+
+- **初期幅の適応調整（`adaptive_aspiration_delta`）**
+  基本幅は `aspiration_window = 88` です。ただし直近の深さで評価値が激しく動いている局面では窓を外しやすいため、評価値変動の指数移動平均 `aspiration_change` に応じて初期の半幅 `delta` を `88`〜`264`（基本幅の1〜3倍）の間で自動的に広げます。
+- **片側ずつの段階的拡大（`widen_aspiration_window`）**
+  探索結果が `alpha` 以下に落ちた（fail-low）場合は下側だけを `score - delta` へ広げ、`beta` 以上に突き抜けた（fail-high）場合は上側だけを `score + delta` へ広げてから `delta` を2倍にし、窓の中に収まるまでルート探索をやり直します。反対側の境界を動かさないことで、再探索中の無駄な枝の広がりを抑えています。
+
+---
+
+## 4. ルート候補手の「探索労力」による並べ替え（`src/search/root.rs`）
+
+ルート局面（`ply == 0`）での手の順序には、通常のノードとは異なる `order_root_moves` を使います。
+
+1. 前回の反復（または置換表）で得られた最善手を先頭に置きます。
+2. 2番目以降のルート候補手は、直前の深さで**その手の部分木につぎ込んだローカル訪問ノード数（`local_node_count`）が多い順**に並べ替えます。
+
+なぜ評価値順ではなくノード数順なのでしょうか。PVS では2番目以降の手はゼロ幅探索で「`alpha` 以下」とだけ判定されるため、正確な評価値順位は分かりません。しかし、相手にとって受けにくく多くの変化を読まされた手（＝将来逆転して最善手に浮上しやすい手）ほど、打ち切るまでに多くのノード数を消費しています。労力のかかった手を前に寄せておくことで、次の深さでの並び順が安定しやすくなります。

@@ -6,15 +6,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rsshogi::board::Position;
 use rsshogi::types::{Bitboard, Color, Move32, RepetitionState};
 
-use crate::eval::Evaluator;
-use crate::nnue::MAX_NNUE_EVAL;
-use crate::params::SearchParams;
+use crate::eval::{Evaluator, MAX_NNUE_EVAL};
 use crate::position::MAX_SEARCH_PLY;
-use crate::tt::TranspositionTable;
 
 use super::history::{CONTINUATION_PLIES, HistoryTables, piece_to_index};
 use super::lmr::LmrReductions;
 use super::ordering::OrderingBuffer;
+use super::params::SearchParams;
+use super::tt::TranspositionTable;
 use super::{MAX_QPLY, SearchLimits};
 
 /// 時間で止める探索で、共有のnode数へまとめて加算し、締切を確かめる間隔(node数)。
@@ -534,5 +533,116 @@ mod tests {
         // 締切はnodeのまとめごとに確かめるので、遅くとも次のまとめの最初で止まる。
         let stopped = (0..=NODE_BATCH).any(|_| context.enter_node().is_none());
         assert!(stopped, "ponderhit must reactivate the same deadline");
+    }
+}
+
+/// 探索木の統計(`stats` feature)。既定のbuildでは何も数えず、呼び出しは空になる。
+pub(super) mod stats {
+    #[derive(Clone, Copy)]
+    pub(in crate::search) enum Stat {
+        MainNodes,
+        QsearchNodes,
+        TtHit,
+        TtCut,
+        BetaCut,
+        BetaCutFirst,
+        BetaCutIndexSum,
+        StoreExact,
+        StoreLower,
+        StoreUpper,
+        FailLowNodes,
+        LmrReduced,
+        LmrResearch,
+        LmrResearchStillHigh,
+        SingularTry,
+        SingularExtend,
+        SingularMultiCut,
+        NullTry,
+        NullCut,
+        ProbCutTry,
+        ProbCutCut,
+        RfpCut,
+        RootIterations,
+        RootBestChanged,
+        RootBestFromLate,
+        AspirationFail,
+        CutNodesWithTt,
+        CutByTt,
+        CutByKiller,
+        CutByCapture,
+        CutByQuiet,
+        CutQuietIndexSum,
+        NodesWithTtMove,
+        LoopNodes,
+    }
+
+    #[cfg(feature = "stats")]
+    const NAMES: [&str; 34] = [
+        "main_nodes",
+        "qsearch_nodes",
+        "tt_hit",
+        "tt_cut",
+        "beta_cut",
+        "beta_cut_first",
+        "beta_cut_index_sum",
+        "store_exact",
+        "store_lower",
+        "store_upper",
+        "fail_low_nodes",
+        "lmr_reduced",
+        "lmr_research",
+        "lmr_research_still_high",
+        "singular_try",
+        "singular_extend",
+        "singular_multicut",
+        "null_try",
+        "null_cut",
+        "probcut_try",
+        "probcut_cut",
+        "rfp_cut",
+        "root_iterations",
+        "root_best_changed",
+        "root_best_from_late",
+        "aspiration_fail",
+        "cut_nodes_with_tt",
+        "cut_by_tt",
+        "cut_by_killer",
+        "cut_by_capture",
+        "cut_by_quiet",
+        "cut_quiet_index_sum",
+        "nodes_with_tt_move",
+        "loop_nodes",
+    ];
+
+    #[cfg(feature = "stats")]
+    static COUNTERS: [std::sync::atomic::AtomicU64; 34] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 34];
+
+    #[inline]
+    pub(in crate::search) fn add(stat: Stat, amount: u64) {
+        #[cfg(feature = "stats")]
+        COUNTERS[stat as usize].fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "stats"))]
+        let _ = (stat, amount);
+    }
+
+    #[inline]
+    pub(in crate::search) fn bump(stat: Stat) {
+        add(stat, 1);
+    }
+
+    pub(in crate::search) fn dump() {
+        #[cfg(feature = "stats")]
+        {
+            let line = NAMES
+                .iter()
+                .zip(COUNTERS.iter())
+                .map(|(name, counter)| {
+                    format!("{name}={}", counter.load(std::sync::atomic::Ordering::Relaxed))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("stats {line}");
+        }
     }
 }

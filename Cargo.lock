@@ -99,17 +99,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsnn-package"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "serde_json_canonicalizer",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "rsshogi"
 version = "1.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -121,13 +110,14 @@ dependencies = [
 
 [[package]]
 name = "rsshogi-nnue-mini"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
- "rsnn-package",
  "rsshogi",
  "rsshogi-usi",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
 ]
 
 [[package]]

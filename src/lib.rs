@@ -1,19 +1,18 @@
 //! NNUE対応の小さなUSI将棋エンジン。
 //!
-//! USIのentry point、同期組み込みAPIと`.rsnn` package検証器を公開する。
+//! USIのentry pointとホスト組み込み用の同期APIを公開する。
 //! 内部moduleはcrate内から所有者のpathで参照する。
 
-pub use nnue::RsnnPackage;
+#![warn(unreachable_pub)]
 
 pub mod api;
-mod clock;
 mod eval;
 #[cfg(feature = "c-api")]
+#[allow(
+    unreachable_pub,
+    reason = "C ABI symbols are exported via #[unsafe(no_mangle)] from a private Rust module"
+)]
 mod ffi;
-mod nnue;
-mod params;
 mod position;
 mod search;
-mod see;
-mod tt;
 pub mod usi;

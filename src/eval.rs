@@ -1,19 +1,24 @@
+mod nnue;
+
 use std::sync::Arc;
 
 use rsshogi::board::Position;
 use rsshogi::types::{Color, Hand, HandPiece, Move32, PieceType};
 
-use crate::nnue::{AccumulatorStack, AonlyNetwork, MAX_NNUE_EVAL};
+use nnue::AccumulatorStack;
+#[cfg(test)]
+pub(crate) use nnue::synthetic_network;
+pub(crate) use nnue::{AOnlyNetwork, MAX_NNUE_EVAL};
 
 #[derive(Clone)]
-pub struct Evaluator {
+pub(crate) struct Evaluator {
     params: EvalParams,
     nnue: Option<NnueEvaluator>,
 }
 
 #[derive(Clone)]
 struct NnueEvaluator {
-    network: Arc<AonlyNetwork>,
+    network: Arc<AOnlyNetwork>,
     stack: AccumulatorStack,
 }
 
@@ -34,56 +39,56 @@ impl Evaluator {
         }
     }
 
-    pub const fn material(params: EvalParams) -> Self {
+    pub(crate) const fn material(params: EvalParams) -> Self {
         Self { params, nnue: None }
     }
 
-    pub fn nnue(params: EvalParams, network: Arc<AonlyNetwork>) -> Self {
+    pub(crate) fn nnue(params: EvalParams, network: Arc<AOnlyNetwork>) -> Self {
         Self { params, nnue: Some(NnueEvaluator { network, stack: AccumulatorStack::default() }) }
     }
 
     /// 探索中の局面を評価する。NNUEでは`initialize`後の`advance`/`undo`と対応していること。
-    pub fn evaluate(&mut self, position: &Position) -> i32 {
+    pub(crate) fn evaluate(&mut self, position: &Position) -> i32 {
         match &mut self.nnue {
             Some(nnue) => nnue.stack.evaluate(&nnue.network, position),
             None => evaluate_material(position, self.params),
         }
     }
 
-    pub fn initialize(&mut self, position: &Position) {
+    pub(crate) fn initialize(&mut self, position: &Position) {
         if let Some(nnue) = &mut self.nnue {
             nnue.stack.reset(&nnue.network, position);
         }
     }
 
     /// `mv`を適用した直後の`position`をaccumulator stackへ積む。計算は評価時まで遅らせる。
-    pub fn advance(&mut self, position: &Position, mv: Move32) {
+    pub(crate) fn advance(&mut self, position: &Position, mv: Move32) {
         if let Some(nnue) = &mut self.nnue {
             nnue.stack.push(position, mv);
         }
     }
 
-    pub fn undo(&mut self) {
+    pub(crate) fn undo(&mut self) {
         if let Some(nnue) = &mut self.nnue {
             nnue.stack.pop();
         }
     }
 
-    pub const fn params(&self) -> EvalParams {
+    pub(crate) const fn params(&self) -> EvalParams {
         self.params
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EvalParams {
-    pub pawn: i32,
-    pub lance: i32,
-    pub knight: i32,
-    pub silver: i32,
-    pub gold: i32,
-    pub bishop: i32,
-    pub rook: i32,
-    pub promotion_bonus: i32,
+pub(crate) struct EvalParams {
+    pub(crate) pawn: i32,
+    pub(crate) lance: i32,
+    pub(crate) knight: i32,
+    pub(crate) silver: i32,
+    pub(crate) gold: i32,
+    pub(crate) bishop: i32,
+    pub(crate) rook: i32,
+    pub(crate) promotion_bonus: i32,
 }
 
 impl Default for EvalParams {
@@ -117,7 +122,7 @@ impl EvalParams {
     }
 }
 
-pub fn evaluate_material(position: &Position, params: EvalParams) -> i32 {
+pub(crate) fn evaluate_material(position: &Position, params: EvalParams) -> i32 {
     evaluate_material_unclamped(position, params).clamp(-MAX_NNUE_EVAL, MAX_NNUE_EVAL)
 }
 

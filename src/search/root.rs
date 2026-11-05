@@ -3,11 +3,10 @@
 use rsshogi::board::Position;
 use rsshogi::types::{MOVE_WIN, Move32};
 
-use crate::tt::{Bound, TtEntry};
-
 use super::context::{SearchContext, tt_key};
-use super::negamax::search_child;
+use super::negamax::search_child_with_key;
 use super::score::{declaration_score, score_to_tt, terminal_score};
+use super::tt::{Bound, TtEntry};
 use super::{MATE, MAX_PV_LENGTH, legal_moves};
 
 /// 置換表を辿って読み筋を組み立てる。
@@ -117,17 +116,45 @@ pub(super) fn search_root(
         }
         let nodes_before = context.local_node_count();
         position.apply_move32(mv);
-        context.table.prefetch(tt_key(position, context.limits.max_moves_to_draw));
+        let child_key = tt_key(position, context.limits.max_moves_to_draw);
+        context.table.prefetch(child_key);
         context.evaluator.advance(position, mv);
         let child_depth = depth.saturating_sub(1);
         let child = if index == 0 {
-            search_child(position, child_depth, alpha, beta, 1, [None; 2], false, context)
+            search_child_with_key(
+                position,
+                child_depth,
+                alpha,
+                beta,
+                1,
+                [None; 2],
+                false,
+                Some(child_key),
+                context,
+            )
         } else {
-            match search_child(position, child_depth, alpha, alpha + 1, 1, [None; 2], true, context)
-            {
-                Some(score) if score > alpha && score < beta => {
-                    search_child(position, child_depth, alpha, beta, 1, [None; 2], false, context)
-                }
+            match search_child_with_key(
+                position,
+                child_depth,
+                alpha,
+                alpha + 1,
+                1,
+                [None; 2],
+                true,
+                Some(child_key),
+                context,
+            ) {
+                Some(score) if score > alpha && score < beta => search_child_with_key(
+                    position,
+                    child_depth,
+                    alpha,
+                    beta,
+                    1,
+                    [None; 2],
+                    false,
+                    Some(child_key),
+                    context,
+                ),
                 other => other,
             }
         };

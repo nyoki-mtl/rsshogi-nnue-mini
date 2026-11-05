@@ -3,8 +3,7 @@
 use rsshogi::board::Position;
 use rsshogi::types::{MOVE_WIN, RepetitionState};
 
-use crate::tt::{Bound, TtEntry};
-
+use super::tt::{Bound, TtEntry};
 use super::{MATE, MATE_TT_THRESHOLD, REPETITION_SUPERIOR};
 
 /// TT entryのboundで窓の外と分かれば、その値を返す。
@@ -33,8 +32,16 @@ pub(super) fn terminal_score(position: &Position, ply: u32, max_moves_to_draw: u
     let state = if ply == 0 {
         position.repetition_state()
     } else {
-        position.repetition_state_with_ply(ply as usize)
+        position.cached_repetition_state_with_ply((ply as usize).saturating_add(1))
     };
+    debug_assert_eq!(
+        state,
+        if ply == 0 {
+            position.repetition_state()
+        } else {
+            position.repetition_state_with_ply(ply as usize)
+        }
+    );
     let repetition = match state {
         RepetitionState::None => None,
         RepetitionState::Win => Some(MATE - ply as i32),
@@ -97,7 +104,7 @@ pub(crate) fn mate_distance(score: i32) -> Option<i32> {
 mod tests {
     use rsshogi::board;
 
-    use crate::nnue::MAX_NNUE_EVAL;
+    use crate::eval::MAX_NNUE_EVAL;
 
     use super::super::test_support::{depth_limits, run_result};
     use super::*;
@@ -225,5 +232,51 @@ mod tests {
         // TTのlower boundでalphaが持ち上がっても、探索がそれを超えられなければUpperのまま。
         assert_eq!(bound_after_search(40, 40), Bound::Upper);
         assert_eq!(bound_after_search(41, 40), Bound::Exact);
+    }
+
+    #[test]
+    fn cached_repetition_lookup_matches_bounded_history_scan_across_all_plies() {
+        use crate::position::SearchPositionExt;
+
+        let check_all_plies = |position: &Position| {
+            for ply in 1..=20_u32 {
+                let cached =
+                    position.cached_repetition_state_with_ply((ply as usize).saturating_add(1));
+                assert_eq!(cached, position.repetition_state_with_ply(ply as usize), "ply={ply}");
+            }
+        };
+
+        // Normal repetition (2-fold, 3-fold, 4-fold) before and after clone_for_search().
+        let mut draw_pos = board::hirate_position();
+        for _ in 0..3 {
+            for text in ["2h3h", "8b7b", "3h2h", "7b8b"] {
+                let mv = board::move_from_usi(&draw_pos, text).expect("legal move");
+                draw_pos.apply_move32(mv);
+                check_all_plies(&draw_pos);
+            }
+        }
+        let mut indexed = draw_pos.clone_for_search();
+        check_all_plies(&indexed);
+        for text in ["7g7f", "3c3d"] {
+            let mv = board::move_from_usi(&indexed, text).expect("legal move");
+            indexed.apply_move32(mv);
+            check_all_plies(&indexed);
+        }
+        indexed.start_search_null().expect("search null move");
+        check_all_plies(&indexed);
+        indexed.finish_search_null().expect("undo search null move");
+        check_all_plies(&indexed);
+
+        // Inferior / Superior repetition and perpetual check.
+        let mut inf_pos = board::position_from_sfen(
+            "lr6l/4g1pkp/2ns1s3/4pp1SP/PPBP2Pp1/2gpPP3/2B2S3/2K6/L6RL b 4P2g3np 1",
+        )
+        .expect("valid inferior-repetition position")
+        .clone_for_search();
+        for text in ["P*2c", "2b2a", "2c2b+", "2a2b"] {
+            let mv = board::move_from_usi(&inf_pos, text).expect("legal move");
+            inf_pos.apply_move32(mv);
+            check_all_plies(&inf_pos);
+        }
     }
 }

@@ -1,5 +1,5 @@
-mod search_api;
-pub(crate) use search_api::{MoveFacts, SearchPositionExt};
+mod search_ext;
+pub(crate) use search_ext::{MoveFacts, SearchPositionExt};
 
 use rsshogi::board::{self, Move32List, Position, generate_legal_all_move32};
 use rsshogi::types::{Color, Hand, HandPiece, PieceType};
@@ -9,7 +9,7 @@ pub(crate) const MAX_SEARCH_DEPTH: u32 = 64;
 pub(crate) const MAX_SEARCH_PLY: u32 = 128;
 pub(crate) const MAX_ROOT_GAME_PLY: u32 = (u16::MAX as u32) - MAX_SEARCH_PLY;
 
-pub fn replay(spec: &PositionSpec, moves: &[String]) -> Result<Position, String> {
+pub(crate) fn replay(spec: &PositionSpec, moves: &[String]) -> Result<Position, String> {
     validate_sfen_hands(spec.as_sfen_parts().2)?;
     let mut position = board::position_from_sfen(&spec.to_sfen()).map_err(|err| err.to_string())?;
     validate_evaluable_position(&position)?;

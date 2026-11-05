@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$ModelPath
+    [string]$ModelPath,
+    [ValidateSet('release', 'production')]
+    [string]$Profile = 'release'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,9 +13,10 @@ if (-not (Test-Path -LiteralPath $model -PathType Leaf)) {
 }
 $modelHash = (Get-FileHash -LiteralPath $model -Algorithm SHA256).Hash.ToLowerInvariant()
 $targetDir = Join-Path $repoRoot 'target/embedded-avx2'
-$source = Join-Path $targetDir 'release/rsshogi-nnue-mini.exe'
+$source = Join-Path $targetDir "$Profile/rsshogi-nnue-mini.exe"
 $dist = Join-Path $repoRoot 'dist'
 $destination = Join-Path $dist 'rsshogi-nnue-mini-embedded-avx2.exe'
+[string[]]$profileArgs = if ($Profile -eq 'release') { @('--release') } else { @('--profile', $Profile) }
 
 $previousFlags = $env:RUSTFLAGS
 $previousPath = $env:RSSHOGI_EMBEDDED_RSNN_PATH
@@ -22,7 +25,7 @@ try {
     $env:RUSTFLAGS = '-C target-feature=+avx2'
     $env:RSSHOGI_EMBEDDED_RSNN_PATH = $model
     $env:RSSHOGI_EMBEDDED_RSNN_SHA256 = $modelHash
-    cargo build --release --locked --features embedded-rsnn --target-dir $targetDir
+    cargo build @profileArgs --locked --features embedded-rsnn --target-dir $targetDir
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed: $LASTEXITCODE"
     }
@@ -40,6 +43,7 @@ $binaryHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.To
     binary_sha256 = $binaryHash
     embedded_rsnn_sha256 = $modelHash
     rustflags = '-C target-feature=+avx2'
+    cargo_profile = $Profile
     cargo_features = 'embedded-rsnn'
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $dist 'rsshogi-nnue-mini-embedded-avx2.json') -Encoding utf8
 Write-Output $destination

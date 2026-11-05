@@ -4,11 +4,9 @@ use crate::position::SearchPositionExt;
 use rsshogi::board::{Captures, Legal, Move32List, Position, generate_moves_move32};
 
 use crate::position::MAX_SEARCH_PLY;
-use crate::see::{quiet_static_exchange_eval, static_exchange_eval};
-use crate::tt::{Bound, TtEntry};
 
 use super::context::{SearchContext, tt_key};
-use super::history::{TriedQuiets, continuation_index, threatened_squares};
+use super::history::{TriedQuiets, continuation_index};
 use super::lmr::{LmrInputs, lmr_reduction, reduction_plies};
 use super::ordering::{MovePicker, OrderedMove, OrderingInputs, is_legal_generated};
 use super::pruning::{
@@ -16,18 +14,47 @@ use super::pruning::{
     should_prune_capture_by_see, should_prune_late_quiet, should_prune_late_quiet_drop,
     should_reverse_futility_prune, should_try_null_move, should_try_singular,
 };
-use super::qsearch::{qsearch, structural_leaf_score};
+use super::qsearch::{qsearch_with_key, structural_leaf_score};
 use super::score::{
     bound_after_search, declaration_score, score_from_tt, score_to_tt, terminal_score, tt_cutoff,
 };
+use super::see::{quiet_static_exchange_ge, static_exchange_ge};
 use super::stats::{Stat, bump};
+use super::tt::{Bound, TtEntry};
 use super::{INF, MATE, MATE_TT_THRESHOLD};
 
 /// 子局面を探索し、手番側から見た値へ符号を戻す。
 ///
 /// `cut_node`は子がfail highすると見込むか。PV nodeでは常に偽。
 #[allow(clippy::too_many_arguments)]
-pub(super) fn search_child(
+pub(super) fn search_child_with_key(
+    position: &mut Position,
+    depth: u32,
+    alpha: i32,
+    beta: i32,
+    ply: u32,
+    static_eval_history: [Option<i32>; 2],
+    cut_node: bool,
+    key_hint: Option<u64>,
+    context: &mut SearchContext,
+) -> Option<i32> {
+    negamax_with_key(
+        position,
+        depth,
+        -beta,
+        -alpha,
+        ply,
+        static_eval_history,
+        cut_node,
+        key_hint,
+        context,
+    )
+    .map(|v| -v)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn negamax(
     position: &mut Position,
     depth: u32,
     alpha: i32,
@@ -37,11 +64,21 @@ pub(super) fn search_child(
     cut_node: bool,
     context: &mut SearchContext,
 ) -> Option<i32> {
-    negamax(position, depth, -beta, -alpha, ply, static_eval_history, cut_node, context).map(|v| -v)
+    negamax_with_key(
+        position,
+        depth,
+        alpha,
+        beta,
+        ply,
+        static_eval_history,
+        cut_node,
+        None,
+        context,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn negamax(
+fn negamax_with_key(
     position: &mut Position,
     depth: u32,
     mut alpha: i32,
@@ -49,12 +86,13 @@ pub(super) fn negamax(
     ply: u32,
     static_eval_history: [Option<i32>; 2],
     cut_node: bool,
+    key_hint: Option<u64>,
     context: &mut SearchContext,
 ) -> Option<i32> {
     let pv_node = beta > alpha.saturating_add(1);
     let zero_window = beta == alpha.saturating_add(1);
     if depth == 0 {
-        return qsearch(position, alpha, beta, ply, 0, context);
+        return qsearch_with_key(position, alpha, beta, ply, 0, key_hint, context);
     }
     context.enter_node()?;
     bump(Stat::MainNodes);
@@ -73,7 +111,8 @@ pub(super) fn negamax(
     // singularの判定探索では、TT moveを除いた残りの手だけを読む。
     // このnodeの結果はTT moveを含む本来の値ではないので、TTでは打ち切らず保存もしない。
     let excluded = context.excluded.get(ply as usize).copied().flatten();
-    let key = tt_key(position, context.limits.max_moves_to_draw);
+    let key = key_hint.unwrap_or_else(|| tt_key(position, context.limits.max_moves_to_draw));
+    debug_assert_eq!(key, tt_key(position, context.limits.max_moves_to_draw));
     let tt_entry = context.table.probe(key);
     if tt_entry.is_some() {
         bump(Stat::TtHit);
@@ -191,8 +230,17 @@ pub(super) fn negamax(
         context.set_continuation(ply, None);
         let reduction = null_move_reduction_amount(depth, eval, beta, &context.params);
         let child_depth = depth.saturating_sub(1 + reduction);
-        let child =
-            search_child(position, child_depth, beta - 1, beta, ply + 1, [None; 2], false, context);
+        let child = search_child_with_key(
+            position,
+            child_depth,
+            beta - 1,
+            beta,
+            ply + 1,
+            [None; 2],
+            false,
+            None,
+            context,
+        );
         position.finish_search_null().expect("a search null move must be undoable");
         let score = child?;
         if score >= beta {
@@ -201,7 +249,7 @@ pub(super) fn negamax(
             // 同じnodeでの再nullだけを抑え、子nodeの通常の枝刈りは維持する。
             let verified = if depth as i32 >= context.params.null_move_verify_depth {
                 let previous_verification = context.null_verification_ply.replace(ply);
-                let verified = negamax(
+                let verified = negamax_with_key(
                     position,
                     depth.saturating_sub(reduction),
                     beta - 1,
@@ -209,6 +257,7 @@ pub(super) fn negamax(
                     ply,
                     static_eval_history,
                     false,
+                    Some(key),
                     context,
                 );
                 // 停止でNoneを返す場合も、呼び出し元の検証範囲を復元してから戻る。
@@ -255,20 +304,27 @@ pub(super) fn negamax(
             generate_moves_move32::<Captures>(position, &mut captures);
             for mv in captures.as_slice().iter().copied() {
                 if !is_legal_generated(position, mv)
-                    || !static_exchange_eval(position, mv, eval_params)
-                        .is_some_and(|see| see >= probcut_beta - eval)
+                    || !static_exchange_ge(position, mv, probcut_beta - eval, eval_params)
                 {
                     continue;
                 }
                 position.apply_move32(mv);
-                context.table.prefetch(tt_key(position, context.limits.max_moves_to_draw));
+                let child_key = tt_key(position, context.limits.max_moves_to_draw);
+                context.table.prefetch(child_key);
                 context.evaluator.advance(position, mv);
                 context.set_continuation(ply, Some(continuation_index(mv, true)));
-                let mut probe =
-                    qsearch(position, -probcut_beta, -probcut_beta + 1, ply + 1, 0, context)
-                        .map(|v| -v);
+                let mut probe = qsearch_with_key(
+                    position,
+                    -probcut_beta,
+                    -probcut_beta + 1,
+                    ply + 1,
+                    0,
+                    Some(child_key),
+                    context,
+                )
+                .map(|v| -v);
                 if probe.is_some_and(|score| score >= probcut_beta) {
-                    probe = search_child(
+                    probe = search_child_with_key(
                         position,
                         depth + 1 - context.params.probcut_min_depth as u32,
                         probcut_beta - 1,
@@ -276,6 +332,7 @@ pub(super) fn negamax(
                         ply + 1,
                         child_static_eval_history,
                         !cut_node,
+                        Some(child_key),
                         context,
                     );
                 }
@@ -317,7 +374,7 @@ pub(super) fn negamax(
             score_from_tt(entry.score, ply) - context.params.singular_margin * depth as i32;
         bump(Stat::SingularTry);
         context.excluded[ply as usize] = Some(tt_mv);
-        let value = negamax(
+        let value = negamax_with_key(
             position,
             (depth - 1) / 2,
             singular_beta - 1,
@@ -325,6 +382,7 @@ pub(super) fn negamax(
             ply,
             static_eval_history,
             cut_node,
+            Some(key),
             context,
         );
         context.excluded[ply as usize] = None;
@@ -337,14 +395,13 @@ pub(super) fn negamax(
             return Some(singular_beta);
         }
     }
-    // 静かな手の履歴を脅威の区分で引くため、相手の駒が利くマスを一度だけ求める。
-    let threats = threatened_squares(position);
+    // 静かな手の履歴を脅威の区分で引くため、相手の駒が利くマスはMovePickerが遅延計算する。
     let inputs = OrderingInputs {
         eval_params: context.evaluator.params(),
         search_params: context.params,
         killers: context.killers.get(ply as usize).copied().unwrap_or([None; 2]),
         previous: context.previous_continuations(ply),
-        threats,
+        threats: None,
         in_check,
     };
     let ordering_buffer = context.take_ordering_buffer(ply);
@@ -382,7 +439,7 @@ pub(super) fn negamax(
         }
         let index = yielded;
         yielded += 1;
-        let OrderedMove { mv, metadata, see, quiet, history_score } = ordered;
+        let OrderedMove { mv, metadata, see, quiet, history_score, .. } = ordered;
         // 捕獲のSEEはMovePickerが取り出し時に払っているので、ここでの判定は
         // 追加計算を伴わない。大きく損な捕獲は浅いnon-PVノードでは読まない。
         if index > 0 && should_prune_capture_by_see(depth, pv_node, in_check, see, &context.params)
@@ -444,23 +501,24 @@ pub(super) fn negamax(
             && !gives_check
             && Some(mv) != tt_move
             && depth <= 3
-            && should_prune_capture_by_see(
-                depth,
-                false,
-                false,
-                quiet_static_exchange_eval(position, mv, context.evaluator.params()),
-                &context.params,
+            && depth as i32 <= context.params.see_prune_max_depth
+            && !quiet_static_exchange_ge(
+                position,
+                mv,
+                -context.params.see_prune_margin * (depth * depth) as i32,
+                context.evaluator.params(),
             )
         {
             continue;
         }
         let child_depth = depth - 1 + u32::from(singular_extension && Some(mv) == tt_move);
         position.apply_move32(mv);
-        context.table.prefetch(tt_key(position, context.limits.max_moves_to_draw));
+        let child_key = tt_key(position, context.limits.max_moves_to_draw);
+        context.table.prefetch(child_key);
         context.evaluator.advance(position, mv);
         context.set_continuation(ply, Some(continuation_index(mv, metadata.is_capture())));
         let child = if index == 0 {
-            search_child(
+            search_child_with_key(
                 position,
                 child_depth,
                 alpha,
@@ -468,6 +526,7 @@ pub(super) fn negamax(
                 ply + 1,
                 child_static_eval_history,
                 !pv_node && !cut_node,
+                Some(child_key),
                 context,
             )
         } else {
@@ -511,7 +570,7 @@ pub(super) fn negamax(
             }
             let reduced_depth = child_depth - reduction as u32;
             context.set_reduction(ply, reduction as u32);
-            let mut scout = search_child(
+            let mut scout = search_child_with_key(
                 position,
                 reduced_depth,
                 alpha,
@@ -519,6 +578,7 @@ pub(super) fn negamax(
                 ply + 1,
                 child_static_eval_history,
                 true,
+                Some(child_key),
                 context,
             );
             context.set_reduction(ply, 0);
@@ -533,7 +593,7 @@ pub(super) fn negamax(
                 let research_depth =
                     (child_depth + u32::from(deeper)).saturating_sub(u32::from(shallower));
                 if research_depth > reduced_depth {
-                    scout = search_child(
+                    scout = search_child_with_key(
                         position,
                         research_depth,
                         alpha,
@@ -541,6 +601,7 @@ pub(super) fn negamax(
                         ply + 1,
                         child_static_eval_history,
                         !cut_node,
+                        Some(child_key),
                         context,
                     );
                 }
@@ -552,7 +613,7 @@ pub(super) fn negamax(
                 }
             }
             match scout {
-                Some(score) if score > alpha && score < beta => search_child(
+                Some(score) if score > alpha && score < beta => search_child_with_key(
                     position,
                     child_depth,
                     alpha,
@@ -560,6 +621,7 @@ pub(super) fn negamax(
                     ply + 1,
                     child_static_eval_history,
                     false,
+                    Some(child_key),
                     context,
                 ),
                 other => other,
@@ -604,6 +666,7 @@ pub(super) fn negamax(
                 context.history.corrections.record(position, depth, score - raw);
             }
             if quiet {
+                let threats = picker.threats(position);
                 context.record_quiet_cutoff(
                     position.turn(),
                     mv,
@@ -703,38 +766,10 @@ mod tests {
     use rsshogi::board;
 
     use crate::eval::EvalParams;
-    use crate::tt::TranspositionTable;
 
     use super::super::test_support::test_context;
+    use super::super::tt::TranspositionTable;
     use super::*;
-
-    #[test]
-    fn search_null_move_roundtrip_preserves_position_and_flips_evaluation() {
-        let mut position = board::hirate_position();
-        let first = board::move_from_usi(&position, "7g7f").expect("legal first move");
-        position.apply_move32(first);
-        let before_sfen = position.to_sfen(None);
-        let before_key = position.key();
-        let before_turn = position.turn();
-        let before_game_ply = position.game_ply();
-        let before_plies_from_null = position.plies_from_null();
-        let before_repetition = position.repetition_state();
-        let before_eval = crate::eval::evaluate_material(&position, EvalParams::default());
-
-        position.start_search_null().expect("search null move");
-        assert_eq!(position.turn(), before_turn.flip());
-        assert_eq!(position.game_ply(), before_game_ply);
-        assert_eq!(position.plies_from_null(), 0);
-        assert_eq!(crate::eval::evaluate_material(&position, EvalParams::default()), -before_eval);
-
-        position.finish_search_null().expect("undo search null move");
-        assert_eq!(position.to_sfen(None), before_sfen);
-        assert_eq!(position.key(), before_key);
-        assert_eq!(position.turn(), before_turn);
-        assert_eq!(position.game_ply(), before_game_ply);
-        assert_eq!(position.plies_from_null(), before_plies_from_null);
-        assert_eq!(position.repetition_state(), before_repetition);
-    }
 
     #[test]
     fn null_verification_restores_scope_and_position_when_node_budget_stops_search() {

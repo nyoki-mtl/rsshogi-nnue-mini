@@ -5,24 +5,37 @@ use crate::position::MoveFacts;
 use crate::position::SearchPositionExt;
 use rsshogi::board::{CapturePlusPro, Legal, Move32List, Position, generate_moves_move32};
 use rsshogi::mate::solve_mate_in_one;
-use rsshogi::types::Move32;
+use rsshogi::types::{Bitboard, Move32};
 
 use crate::eval::{EvalParams, Evaluator};
 use crate::position::MAX_SEARCH_PLY;
-use crate::tt::{Bound, TtEntry};
 
 use super::context::{SearchContext, tt_key};
-use super::history::{CONTINUATION_PLIES, threatened_squares};
+use super::history::CONTINUATION_PLIES;
 use super::ordering::{MovePicker, OrderedMove, OrderingInputs, is_legal_generated};
 use super::score::{bound_after_search, declaration_score, score_to_tt, terminal_score, tt_cutoff};
+use super::tt::{Bound, TtEntry};
 use super::{CaptureSee, MATE, MAX_QPLY, legal_moves};
 
+#[cfg(test)]
 pub(super) fn qsearch(
+    position: &mut Position,
+    alpha: i32,
+    beta: i32,
+    ply: u32,
+    qply: u32,
+    context: &mut SearchContext,
+) -> Option<i32> {
+    qsearch_with_key(position, alpha, beta, ply, qply, None, context)
+}
+
+pub(super) fn qsearch_with_key(
     position: &mut Position,
     mut alpha: i32,
     beta: i32,
     ply: u32,
     qply: u32,
+    key_hint: Option<u64>,
     context: &mut SearchContext,
 ) -> Option<i32> {
     context.enter_node()?;
@@ -37,7 +50,10 @@ pub(super) fn qsearch(
         return Some(structural_leaf_score(position, ply, &mut context.evaluator));
     }
     // 静止探索の全nodeでTTを読み書きする。
-    let tt = QsearchTt { key: Some(tt_key(position, context.limits.max_moves_to_draw)), ply };
+    let resolved_key =
+        key_hint.unwrap_or_else(|| tt_key(position, context.limits.max_moves_to_draw));
+    debug_assert_eq!(resolved_key, tt_key(position, context.limits.max_moves_to_draw));
+    let tt = QsearchTt { key: Some(resolved_key), ply };
     // 深いentryほど信頼できるので、depthによるprobeの制限は設けない。
     // 保存側はdepth 0のままなので、主探索のentryを上書きすることはない。
     let tt_entry = tt.key.and_then(|key| context.table.probe(key));
@@ -97,14 +113,10 @@ pub(super) fn qsearch(
         eval_params: context.evaluator.params(),
         search_params: context.params,
         killers: [None; 2],
-        // continuationは引かない。静かな王手回避のmain historyは実際の脅威で引く。
+        // continuationは引かない。静かな王手回避のmain historyは実際の脅威で遅延参照する。
         previous: [None; CONTINUATION_PLIES],
         in_check,
-        threats: if in_check {
-            threatened_squares(position)
-        } else {
-            rsshogi::types::Bitboard::EMPTY
-        },
+        threats: if in_check { None } else { Some(Bitboard::EMPTY) },
     };
     let mut picker =
         MovePicker::new(position, moves, tt_move, inputs, &context.history, ordering_buffer);
@@ -112,11 +124,13 @@ pub(super) fn qsearch(
     let mut best_move = None;
     let mut pruned_move = false;
     while let Some(ordered) = picker.next(position, &context.history) {
-        let OrderedMove { mv, metadata, see, .. } = ordered;
-        // 王手判定は並べ替えでは払わず、枝刈り判定の直前で遅延計算する。
+        let OrderedMove { mv, metadata, see, known_check, .. } = ordered;
+        // 非quiet手の王手判定はMovePickerのスコア付け結果を再利用する。
         // 王手回避中はSEE刈りが除外され、delta刈りもstand_patが無く成立しない
         // ため、判定自体を省略できる。
-        let gives_check = !in_check && position.gives_check_move32(mv);
+        let gives_check =
+            !in_check && known_check.unwrap_or_else(|| position.gives_check_move32(mv));
+        debug_assert_eq!(gives_check, !in_check && position.gives_check_move32(mv));
         if should_prune_qsearch_capture_by_see(
             metadata,
             in_check || gives_check,
@@ -135,9 +149,12 @@ pub(super) fn qsearch(
             continue;
         }
         position.apply_move32(mv);
-        context.table.prefetch(tt_key(position, context.limits.max_moves_to_draw));
+        let child_key = tt_key(position, context.limits.max_moves_to_draw);
+        context.table.prefetch(child_key);
         context.evaluator.advance(position, mv);
-        let child = qsearch(position, -beta, -alpha, ply + 1, qply + 1, context).map(|v| -v);
+        let child =
+            qsearch_with_key(position, -beta, -alpha, ply + 1, qply + 1, Some(child_key), context)
+                .map(|v| -v);
         position.undo_move32(mv).expect("a searched move must be undoable");
         context.evaluator.undo();
         let score = child?;
@@ -240,17 +257,17 @@ mod tests {
 
     use rsshogi::board;
 
-    use crate::see::static_exchange_eval;
-    use crate::tt::TranspositionTable;
-
     use super::super::INF;
+    use super::super::history::threatened_squares;
     use super::super::score::score_from_tt;
+    use super::super::see::static_exchange_eval;
     use super::super::test_support::test_context;
+    use super::super::tt::TranspositionTable;
     use super::*;
 
     #[test]
     fn corrected_evaluations_stay_outside_the_mate_band() {
-        use crate::nnue::MAX_NNUE_EVAL;
+        use crate::eval::MAX_NNUE_EVAL;
 
         use super::super::negamax::negamax;
         use super::super::score::mate_distance;
@@ -412,14 +429,7 @@ mod tests {
         let mut context = test_context(Arc::new(AtomicU64::new(0)), Some(2));
         context.history.record_quiet_cutoff(position.turn(), preferred, &[], 16, threats);
         assert!(context.history.quiet_score(position.turn(), preferred, threats) > 0);
-        assert_eq!(
-            context.history.quiet_score(
-                position.turn(),
-                preferred,
-                rsshogi::types::Bitboard::EMPTY
-            ),
-            0
-        );
+        assert_eq!(context.history.quiet_score(position.turn(), preferred, Bitboard::EMPTY), 0);
         position.apply_move32(preferred);
         let child_key = tt_key(&position, 0);
         position.undo_move32(preferred).expect("undo preferred evasion");
